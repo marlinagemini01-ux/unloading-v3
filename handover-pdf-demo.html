@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- GAS_DYNAMIC: title data.session.brand, data.session.shipment -->
+  <title>Handover Demo - Yadah PO 1</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    /* =========================
+       DESIGN TOKENS
+       Semua variable CSS untuk tuning cepat.
+       Ubah angka di sini tanpa harus scroll ke bawah.
+       ========================= */
+    :root {
+      /* --- Page / A4 Wrapper --- */
+      --page-width: 210mm;
+      --page-min-height: 297mm;
+      --page-padding: 32px 20px;        /* Margin luar: layar → kertas (screen preview) */
+      --report-padding: 28px 32px;       /* Margin dalam kertas A4 (kiri-kanan 32px agar tidak boros) */
+      --report-padding-print: 28px 32px; /* Margin dalam saat print/PDF */
+
+      /* --- Font --- */
+      --font-family: "Inter", system-ui, -apple-system, sans-serif;
+      --font-size-base: 12px;
+      --font-size-company-name: 15px;
+      --font-size-company-address: 11px;
+      --font-size-title: 20px;
+
+      /* --- Summary Box --- */
+      --summary-box-padding: 14px 20px;    /* Padding outer box: atas-bawah seimbang, kiri-kanan lega */
+      --summary-inner-max-width: 96%;      /* Lebar maks inner grid — turunkan jika ingin lebih compact */
+      --summary-col-gap: 32px;             /* Gap horizontal antar 3 kolom — stabil dan seimbang */
+      --summary-row-gap: 6px;              /* Gap vertikal antar baris info */
+      --summary-font-size: 11px;
+      --summary-label-width: 92px;          /* Lebar fixed label */
+      --summary-colon-width: 10px;          /* Lebar titik dua */
+      --summary-value-gap: 4px;             /* Jarak titik dua ke value */
+
+      /* --- Table --- */
+      --table-font-header: 9.5px;
+      --table-font-body: 11px;
+      --table-cell-padding: 5px 6px;
+      --table-header-padding: 6px 6px;
+
+      /* --- Signature --- */
+      --signature-width: 240px;
+      --signature-height: 130px;
+      --signature-gap: 32px;             /* Jarak horizontal antar 2 box */
+      --signature-margin-top: 28px;      /* Jarak dari tabel ke signature */
+      --signature-header-font: 12px;
+      --signature-meta-font: 11px;
+      --signature-label-width: 38px;     /* Lebar "Name" / "Date" */
+      --signature-line-width: 150px;     /* Lebar garis bawah nama/tanggal */
+
+      /* --- Colors --- */
+      --primary-color: #1e293b;
+      --secondary-color: #64748b;
+      --border-color: #e2e8f0;
+      --bg-color: #f1f5f9;
+      --surface-color: #ffffff;
+      --surface-soft-color: #f8fafc;
+      --surface-table-head: #f1f5f9;
+      --table-border-color: #cbd5e1;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+
+      /* --- Spacing antar section (konsisten) --- */
+      --section-gap: 16px;  /* Jarak default antar section: divider→title, title→summary, summary→table */
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: var(--font-family);
+      font-size: var(--font-size-base);
+      color: var(--text-main);
+      background-color: var(--bg-color);
+      line-height: 1.5;
+    }
+
+    /* =========================
+       SCREEN PREVIEW MODE
+       Body wrapper agar kertas A4 tampil centered di browser.
+       ========================= */
+    .screen-preview {
+      display: flex;
+      justify-content: center;
+      padding: var(--page-padding);
+    }
+
+    /* =========================
+       A4 PAGE WRAPPER
+       Simulasi kertas A4 di layar.
+       ========================= */
+    .a4-wrapper {
+      background-color: var(--surface-color);
+      width: var(--page-width);
+      min-height: var(--page-min-height);
+      padding: var(--report-padding);
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+    }
+
+    /* =========================
+       1. HEADER
+       Logo/text kiri — nama PT & alamat kanan.
+       ========================= */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .header-left {
+      font-size: 22px;
+      font-weight: 700;
+      color: #D6124B;
+      letter-spacing: -0.5px;
+      /* GAS_DYNAMIC: ganti dengan <img> logo */
+    }
+
+    .header-right {
+      text-align: right;
+      max-width: 380px;
+    }
+
+    .company-name {
+      font-size: var(--font-size-company-name);
+      font-weight: 700;
+      color: var(--primary-color);
+      line-height: 1.3;
+    }
+
+    .company-address {
+      margin-top: 3px;
+      font-size: var(--font-size-company-address);
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    /* 2. DIVIDER */
+    .divider {
+      height: 1px;
+      background-color: var(--table-border-color);
+      margin-bottom: var(--section-gap);
+    }
+
+    /* =========================
+       3. REPORT TITLE
+       ========================= */
+    .report-title {
+      font-size: var(--font-size-title);
+      font-weight: 700;
+      color: var(--primary-color);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: var(--section-gap);
+    }
+
+    /* =========================
+       4. SUMMARY BOX
+       2-layer structure:
+       - .summary-box  = outer container (background, border, padding) → full width sejajar tabel
+       - .summary-grid = inner grid (3 kolom auto + column-gap stabil) → max-width + margin auto = centered
+       Hasilnya: box full width, konten compact di tengah, tidak menyebar ke ujung.
+       ========================= */
+    .summary-box {
+      background-color: var(--surface-soft-color);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: var(--summary-box-padding);
+      margin-bottom: var(--section-gap);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: auto auto auto;
+      column-gap: var(--summary-col-gap);  /* Gap stabil dan konsisten antar 3 grup */
+      align-items: center;
+      max-width: var(--summary-inner-max-width);
+      margin: 0 auto;                      /* KUNCI: inner grid centered di dalam box */
+    }
+
+    .summary-column {
+      display: flex;
+      flex-direction: column;
+      gap: var(--summary-row-gap);
+    }
+
+    .summary-row {
+      display: flex;
+      align-items: baseline;      /* Label, colon, value sejajar baseline teks */
+      font-size: var(--summary-font-size);
+      line-height: 1.5;
+    }
+
+    .summary-label {
+      width: var(--summary-label-width);
+      flex-shrink: 0;             /* Label tidak boleh menyusut */
+      font-weight: 600;
+      color: var(--secondary-color);
+      white-space: nowrap;
+      text-align: left;           /* Label tetap rata kiri */
+    }
+
+    .summary-colon {
+      width: var(--summary-colon-width);
+      flex-shrink: 0;             /* Colon lebar tetap = sejajar vertikal antar baris */
+      color: var(--secondary-color);
+      text-align: center;
+    }
+
+    .summary-value {
+      flex: 1;
+      margin-left: var(--summary-value-gap);
+      font-weight: 700;
+      color: var(--text-main);
+      white-space: nowrap;        /* KUNCI: value tidak boleh wrap */
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: left;           /* Value rata kiri setelah colon */
+    }
+
+    /* =========================
+       5. TABEL DETAIL ARMADA
+       table-layout: fixed agar browser menghormati width kolom.
+       Body cell diberi nowrap. Header boleh 2 baris.
+       ========================= */
+    .table-container {
+      margin-bottom: var(--section-gap);
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid var(--table-border-color);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-size: var(--table-font-body);
+    }
+
+    th, td {
+      border: 1px solid var(--table-border-color);
+      vertical-align: middle;
+    }
+
+    th {
+      padding: var(--table-header-padding);
+      background-color: var(--surface-table-head);
+      font-size: var(--table-font-header);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      color: var(--primary-color);
+      text-align: center;
+      line-height: 1.3;
+      white-space: normal;  /* Header boleh wrap 2 baris jika perlu */
+    }
+
+    td {
+      padding: var(--table-cell-padding);
+      white-space: nowrap;      /* Body: nilai pendek jangan pecah */
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Driver Name boleh wrap jika nama sangat panjang */
+    td:nth-child(2) {
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    /* --- Distribusi lebar kolom (total ≈ 100%) ---
+       Kolom angka/pendek dikecilkan → ruang untuk teks dilebarkan */
+    th:nth-child(1), td:nth-child(1) { width: 4%;  text-align: center; } /* No */
+    th:nth-child(2), td:nth-child(2) { width: 17%; text-align: left;   } /* Driver Name */
+    th:nth-child(3), td:nth-child(3) { width: 13%; text-align: center; } /* Plate No */
+    th:nth-child(4), td:nth-child(4) { width: 16%; text-align: center; } /* Vehicle Type */
+    th:nth-child(5), td:nth-child(5) { width: 10%; text-align: center; } /* Container No */
+    th:nth-child(6), td:nth-child(6) { width: 11%; text-align: center; } /* Pallet No */
+    th:nth-child(7), td:nth-child(7) { width: 10%; text-align: center; } /* Actual Qty */
+    th:nth-child(8), td:nth-child(8) { width: 9%;  text-align: center; } /* SJ Qty */
+    th:nth-child(9), td:nth-child(9) { width: 10%; text-align: center; } /* Variance */
+
+    tbody tr:nth-child(even) {
+      background-color: var(--surface-soft-color);
+    }
+
+    /* =========================
+       6. SIGNATURE
+       Dua box sejajar, compact, formal.
+       Name di atas, Date di bawah. Garis bawah terkontrol via --signature-line-width.
+       ========================= */
+    .signatures-wrapper {
+      display: flex;
+      justify-content: center;
+      gap: var(--signature-gap);
+      margin-top: var(--signature-margin-top);
+      page-break-inside: avoid;
+    }
+
+    .signature-box {
+      width: var(--signature-width);
+      height: var(--signature-height);
+      border: 1px solid var(--table-border-color);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      background-color: var(--surface-color);
+    }
+
+    .signature-header {
+      background-color: var(--surface-table-head);
+      padding: 8px 10px;
+      text-align: center;
+      font-weight: 700;
+      font-size: var(--signature-header-font);
+      border-bottom: 1px solid var(--table-border-color);
+      border-radius: 6px 6px 0 0;
+      color: var(--primary-color);
+    }
+
+    .signature-body {
+      flex: 1;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+
+    .signature-space {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      /* GAS_DYNAMIC: tempat <img> tanda tangan */
+    }
+
+    .signature-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: var(--signature-meta-font);
+    }
+
+    .meta-row {
+      display: flex;
+      align-items: flex-end;
+    }
+
+    .meta-label {
+      width: var(--signature-label-width);
+      color: var(--text-muted);
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    .meta-value {
+      width: var(--signature-line-width);
+      font-weight: 700;
+      color: var(--text-main);
+      border-bottom: 1px solid var(--text-main);
+      text-align: center;
+      padding-bottom: 1px;
+      min-height: 18px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* =========================
+       PRINT BUTTON (demo only, hidden saat print)
+       ========================= */
+    .btn-print {
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      background-color: #1e293b;
+      color: white;
+      border: none;
+      padding: 10px 22px;
+      border-radius: 50px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: var(--font-family);
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      z-index: 100;
+      transition: background-color 0.2s;
+    }
+
+    .btn-print:hover {
+      background-color: #0f172a;
+    }
+
+    /* =========================
+       7. PRINT / PDF CSS
+       @page A4 portrait, margin 0 (semua dihandle oleh --report-padding-print).
+       Shadow, border, radius dihilangkan saat print agar bersih.
+       ========================= */
+    @media print {
+      @page {
+        size: A4 portrait;
+        margin: 0;
+      }
+
+      body {
+        background-color: white;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      .screen-preview {
+        padding: 0;
+        display: block;
+      }
+
+      .a4-wrapper {
+        box-shadow: none;
+        border: none;
+        border-radius: 0;
+        width: 100%;
+        min-height: auto;
+        padding: var(--report-padding-print);
+        margin: 0;
+        page-break-after: always;
+      }
+
+      .btn-print {
+        display: none !important;
+      }
+
+      .table-container,
+      .signatures-wrapper {
+        page-break-inside: avoid;
+      }
+
+      /* Hilangkan hover effect saat print */
+      tbody tr:nth-child(even) {
+        background-color: var(--surface-soft-color) !important;
+      }
+    }
+  </style>
+</head>
+<body class="screen-preview">
+
+  <!-- A4 Page Wrapper -->
+  <div class="a4-wrapper">
+
+    <!-- ============================
+         HEADER
+         Logo/text sociolla di kiri, identitas PT di kanan.
+         GAS_DYNAMIC: logo data.config.logoDataUri / logoFileId
+         ============================ -->
+    <div class="header">
+      <div class="header-left">
+        SOCIOLLA
+      </div>
+      <div class="header-right">
+        <!-- GAS_DYNAMIC: company info -->
+        <div class="company-name">PT Sociolla Bella Indonesia</div>
+        <div class="company-address">
+          Kavling Blok W01 Griya Idola Industrial Park, Jl. Raya Serang<br>
+          Km.12, Bitung Jaya, Kec. Cikupa, Tangerang,<br>
+          Banten 15710
+        </div>
+      </div>
+    </div>
+
+    <!-- DIVIDER -->
+    <div class="divider"></div>
+
+    <!-- ============================
+         REPORT TITLE
+         GAS_DYNAMIC: data.config.title
+         ============================ -->
+    <div class="report-title">UNLOADING REPORT B2B</div>
+
+    <!-- ============================
+         SUMMARY INFO BOX — 3 kolom
+         GAS_DYNAMIC: data.session.* & data.summary.*
+         ============================ -->
+    <div class="summary-box">
+      <div class="summary-grid">
+        <!-- Kolom 1: Session -->
+        <div class="summary-column">
+          <div class="summary-row">
+            <span class="summary-label">Brand</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.session.brand -->
+            <span class="summary-value">Yadah</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Shipment</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.session.shipment -->
+            <span class="summary-value">PO 1</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Inbound Date</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.session.inboundDate -->
+            <span class="summary-value">2026-06-04</span>
+          </div>
+        </div>
+
+        <!-- Kolom 2: Forwarder & Fleet -->
+        <div class="summary-column">
+          <div class="summary-row">
+            <span class="summary-label">Forwarder</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.session.forwarder -->
+            <span class="summary-value">Pt. Inter Link</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Total Container</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.summary.totalFleet -->
+            <span class="summary-value">1</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Total Pallet</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.summary.totalPalet -->
+            <span class="summary-value">1</span>
+          </div>
+        </div>
+
+        <!-- Kolom 3: Qty Summary -->
+        <div class="summary-column">
+          <div class="summary-row">
+            <span class="summary-label">Total Koli Aktual</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.summary.totalActualQty -->
+            <span class="summary-value">28</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Total Koli SJ</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.summary.totalSjQty -->
+            <span class="summary-value">28</span>
+          </div>
+          <div class="summary-row">
+            <span class="summary-label">Selisih Koli</span>
+            <span class="summary-colon">:</span>
+            <!-- GAS_DYNAMIC: data.summary.totalVariance -->
+            <span class="summary-value">0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================
+         TABEL DETAIL ARMADA
+         GAS_DYNAMIC: loop data.fleets & fleet.paletDetails
+         ============================ -->
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>No</th>
+            <th>Driver Name</th>
+            <th>Plate No.</th>
+            <th>Vehicle Type</th>
+            <th>Container No.</th>
+            <th>Pallet No.</th>
+            <th>Actual Qty</th>
+            <th>SJ Qty</th>
+            <th>Variance</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <!-- GAS_DYNAMIC: fleet.driver -->
+            <td>Maulana</td>
+            <!-- GAS_DYNAMIC: fleet.plate -->
+            <td>B 9340 UIX</td>
+            <!-- GAS_DYNAMIC: fleet.type -->
+            <td>Container 40ft</td>
+            <!-- GAS_DYNAMIC: fleet.number -->
+            <td>1</td>
+            <!-- GAS_DYNAMIC: palet.displayName || palet.name -->
+            <td>Palet 1</td>
+            <!-- GAS_DYNAMIC: palet.actualQty -->
+            <td>28</td>
+            <!-- GAS_DYNAMIC: palet.sjQty -->
+            <td>28</td>
+            <!-- GAS_DYNAMIC: palet.variance -->
+            <td>0</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ============================
+         SIGNATURE
+         GAS_DYNAMIC: data.config.signatureLeft / signatureRight
+         GAS_DYNAMIC: signature data.config
+         ============================ -->
+    <div class="signatures-wrapper">
+      <!-- PIC Unloading -->
+      <div class="signature-box">
+        <!-- GAS_DYNAMIC: data.config.signatureLeft -->
+        <div class="signature-header">PIC Unloading</div>
+        <div class="signature-body">
+          <div class="signature-space">
+            <!-- GAS_DYNAMIC: picSignatureDataUri -->
+          </div>
+          <div class="signature-meta">
+            <div class="meta-row">
+              <div class="meta-label">Name</div>
+              <!-- GAS_DYNAMIC: data.session.pic -->
+              <div class="meta-value">Marlina / Dicki Kosas</div>
+            </div>
+            <div class="meta-row">
+              <div class="meta-label">Date</div>
+              <!-- GAS_DYNAMIC: data.session.date -->
+              <div class="meta-value">04 June 2026</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loss Prevention -->
+      <div class="signature-box">
+        <!-- GAS_DYNAMIC: data.config.signatureRight -->
+        <div class="signature-header">Loss Prevention</div>
+        <div class="signature-body">
+          <div class="signature-space">
+            <!-- GAS_DYNAMIC: lossPreventionSignatureDataUri -->
+          </div>
+          <div class="signature-meta">
+            <div class="meta-row">
+              <div class="meta-label">Name</div>
+              <!-- GAS_DYNAMIC: data.session.lossPreventionName -->
+              <div class="meta-value">Ujang</div>
+            </div>
+            <div class="meta-row">
+              <div class="meta-label">Date</div>
+              <!-- GAS_DYNAMIC: data.session.lossPreventionDate -->
+              <div class="meta-value">04 June 2026</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div> <!-- End of a4-wrapper -->
+
+  <button class="btn-print" onclick="window.print()">Simulasi Print PDF</button>
+
+</body>
+</html>

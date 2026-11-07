@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Handover - <?= data.session.brand ?> <?= data.session.shipment ?></title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+    :root {
+      /* =========================
+     Maintenance: Color Tokens
+     Ubah untuk warna global report.
+     ========================= */
+      /* =========================
+     Maintenance: Color Tokens
+     Ubah untuk warna global report.
+     ========================= */
+      --primary-color: #1e293b;
+      /* Warna gelap utama (untuk judul, border tebal) */
+      --secondary-color: #64748b;
+      /* Warna abu-abu (untuk label info, ikon, teks redup) */
+      --border-color: #e2e8f0;
+      /* Warna garis batas luar kotak dan pemisah halaman */
+      --bg-color: #f8fafc;
+      /* Warna latar belakang layar paling luar (di luar kertas) */
+      --text-main: #0f172a;
+      /* Warna hitam kebiruan untuk teks standar yang dibaca */
+      --text-muted: #475569;
+      /* Warna teks yang tidak terlalu penting / keterangan tambahan */
+
+      --surface-color: #ffffff;
+      /* Warna putih bersih untuk dasar kertas report */
+      --surface-soft-color: #f8fafc;
+      /* Warna abu-abu sangat muda untuk background kotak Info Grid */
+      --surface-table-head-color: #f1f5f9;
+      /* Warna latar belakang khusus untuk judul kolom di Tabel */
+      --table-border-color: #cbd5e1;
+      /* Warna garis-garis kotak di dalam Tabel */
+
+      /* =========================
+     Maintenance: Typography
+     Nama variabel dibuat spesifik per area.
+     ========================= */
+      --font-family-base: "Inter", system-ui, -apple-system, sans-serif;
+      /* Jenis font dasar untuk seluruh dokumen */
+
+      /* Ukuran Font Header Perusahaan */
+      --font-size-company-name: 20px;
+      /* Ukuran tulisan nama perusahaan di kiri atas */
+      --font-size-company-address: 14px;
+      /* Ukuran tulisan alamat perusahaan */
+
+      /* Ukuran Font Judul Report (UNLOADING REPORT B2B) */
+      --font-size-report-title-desktop: 24px;
+      /* Ukuran judul saat dibuka di Laptop/PC */
+      --font-size-report-title-tablet: 22px;
+      /* Ukuran judul saat dibuka di Tablet */
+      --font-size-report-title-mobile: 20px;
+      /* Ukuran judul saat dibuka di HP */
+
+      /* Ukuran Font Info Grid (Brand, Shipment, dll) */
+      --font-size-info-label: 14px;
+      /* Ukuran teks nama label (misal: "Brand", "Forwarder") */
+      --font-size-info-value: 14px;
+      /* Ukuran teks isian nilainya (misal: "Acwell", "Sms") */
+
+      /* Ukuran Font Tabel */
+      --font-size-table-header: 11px;
+      /* Ukuran teks pada judul kolom tabel (Product ID, Name, dll) */
+      --font-size-table-body: 13px;
+      /* Ukuran teks isi data tabel di bawahnya */
+
+      /* Ukuran Font Tanda Tangan */
+      --font-size-signature-title: 14px;
+      /* Ukuran jabatan penanda tangan (Dibuat Oleh, Diterima Oleh) */
+      --font-size-signature-body: 13px;
+      /* Ukuran nama orang yang bertanda tangan */
+
+      /* Ukuran Font Tombol Print */
+      --font-size-print-button: 15px;
+      /* Ukuran tulisan "Print Halaman" di Laptop */
+      --font-size-print-button-mobile: 14px;
+      /* Ukuran tulisan "Print Halaman" di HP */
+
+      /* =========================
+     Maintenance: Page & Layout
+     Ubah untuk ukuran container utama dan spacing global.
+     ========================= */
+      --page-padding-desktop: 40px 20px;
+      /* Jarak ruang layar ke kertas utama di Laptop */
+      --page-padding-tablet: 20px 10px;
+      /* Jarak ruang layar ke kertas utama di Tablet */
+      --report-max-width: 950px;
+      /* Lebar maksimal kertas agar tidak melebar ditarik di layar ultra-wide */
+      --report-padding-desktop: 56px 48px;
+      /* Ruang kosong (margin dalam) di keliling kertas di Laptop */
+      --report-padding-tablet: 24px 20px;
+      /* Ruang kosong (margin dalam) di keliling kertas di Tablet */
+      --report-padding-mobile: 20px 16px;
+      /* Ruang kosong (margin dalam) di keliling kertas di HP */
+      --report-padding-print: 20px;
+      /* Batas tepi kertas (margin) saat dokumen ini di-Print */
+
+      --report-radius-desktop: 20px;
+      /* Lengkungan sudut kertas report (rounded corners) di Laptop */
+      --report-radius-mobile: 12px;
+      /* Lengkungan sudut kertas report di HP */
+      --panel-radius: 12px;
+      /* Lengkungan sudut pada kotak Info Grid dan kotak Tanda Tangan */
+      --editable-radius: 4px;
+      /* Lengkungan kotak saat kursor diarahkan ke teks yang bisa diedit */
+
+      --header-gap: 24px;
+      /* Jarak ruang antara blok logo perusahaan dengan judul report */
+      --header-gap-mobile: 16px;
+      /* Jarak ruang tersebut saat dilihat di HP */
+      --header-company-max-width: 460px;
+      /* Batas lebar maksimal ruang teks alamat perusahaan */
+      --header-logo-width: 180px;
+      /* Lebar maksimal gambar logo klien di kanan atas */
+      --header-logo-max-height: 48px;
+      /* Tinggi maksimal gambar logo klien */
+      --company-address-margin-top: 6px;
+      /* Jarak dari Nama Perusahaan ke Alamat Perusahaan */
+      --header-divider-margin: 16px 0 14px;
+      /* Jarak garis pembatas horizontal di atas Info Grid */
+      --report-heading-margin-bottom: 18px;
+      /* Jarak kosong antara Judul Report dengan kotak Info Grid */
+
+      /* =========================
+     Maintenance: Report Info Box
+     Dipakai untuk blok Brand/Shipment/Inbound Date dan total.
+     ========================= */
+      --report-info-padding: 14px 18px;
+      /* Ruang bernapas dalam kotak abu-abu Info Grid (Laptop) */
+      --report-info-padding-mobile: 16px;
+      /* Ruang bernapas dalam kotak Info Grid (HP) */
+      --report-info-margin-bottom: 18px;
+      /* Jarak kosong antara kotak Info Grid dengan Tabel di bawahnya */
+      --report-info-column-min-width: 300px;
+      /* Lebar batas minimal per grup informasi agar tidak terlalu menyempit */
+      --report-info-column-gap: 24px;
+      /* Jarak ruang kosong yang memisahkan Grup 1, Grup 2, dan Grup 3 */
+
+      /* --- PENGATURAN GESER POSISI KOLOM (INFO GRID) --- 
+         Ubah angka di bawah ini (misal: 20px, 40px, atau -10px) 
+         jika Anda ingin menggeser masing-masing grup ke kanan atau ke kiri. */
+      --report-info-offset-col1: 10px;
+      /* Geser Grup 1 (Brand, Shipment, Inbound Date) */
+      --report-info-offset-col2: 20px;
+      /* Geser Grup 2 (Forwarder, Total Container, Total Pallet) */
+      --report-info-offset-col3: 10px;
+      /* Geser Grup 3 (Total Koli SJ, Total Koli Aktual, Selisih) */
+
+      --report-info-row-gap: 8px;
+      /* Jarak tinggi pemisah antar baris di dalam info grid (Brand ke Shipment) */
+      --report-info-row-gap-mobile: 10px;
+      /* Jarak tinggi pemisah saat di HP */
+      --report-info-item-gap: 8px;
+      /* Jarak kosong antara Label -> Titik Dua -> Value */
+
+      --report-info-label-width: 135px;
+      /* Lebar khusus yang di-booking untuk teks Label di Laptop (harus lebih panjang dari kata terpanjang) */
+      --report-info-label-width-tablet: 120px;
+      /* Lebar khusus area Label saat di Tablet */
+      --report-info-label-width-mobile: 110px;
+      /* Lebar khusus area Label saat di HP */
+      --report-info-colon-width: 12px;
+      /* Lebar ruang khusus untuk tanda titik dua ( : ) */
+      --report-info-item-min-height: 22px;
+      /* Tinggi minimal satu baris info grid */
+
+      /* =========================
+     Maintenance: Table
+     Pisahkan kontrol header tabel dan body tabel.
+     ========================= */
+      --table-margin-bottom: 40px;
+      /* Jarak kosong dari bawah Tabel menuju area Tanda Tangan */
+      --table-header-cell-padding: 6px 12px;
+      /* Ketebalan ruang dalam tiap kotak judul tabel (mempengaruhi tinggi header tabel) */
+      --table-body-cell-padding: 6px 12px;
+      /* Ketebalan ruang dalam tiap kotak isi tabel (mempengaruhi seberapa renggang data tabelnya) */
+      --table-header-row-height: 44px;
+      /* Tinggi paksaan paling minimal untuk judul kolom tabel */
+      --table-body-row-height: 36px;
+      /* Tinggi paksaan paling minimal untuk isi/body tabel */
+      --table-cell-vertical-align: middle;
+      /* Mengatur text tabel di tengah (vertical center) atau di atas (top) */
+      --table-header-letter-spacing: 0.2px;
+      /* Kerenggangan antar-huruf khusus untuk teks di judul tabel */
+      --table-header-line-height: 1.3;
+      /* Jarak tinggi antar-baris jika judul tabel terlalu panjang dan turun ke bawah */
+      --table-row-alt-color: #f8fafc;
+      /* Warna selang-seling (zebra cross) baris tabel genap */
+      --table-row-hover-color: #f1f5f9;
+      /* Warna highlight baris tabel saat dilewati mouse */
+
+      /* =========================
+     Maintenance: Signatures
+     Dipakai untuk dua kotak tanda tangan.
+     ========================= */
+      --signature-gap: 60px;
+      /* Jarak horizontal pemisah antara kolom tanda tangan "Dibuat Oleh" dengan "Diterima Oleh" */
+      --signature-gap-mobile: 24px;
+      /* Jarak vertikal pemisah tanda tangan saat tertumpuk di HP */
+      --signature-margin-top: 50px;
+      /* Jarak kosong dari isi di atasnya (Tabel) menuju kotak Tanda Tangan */
+      --signature-margin-top-mobile: 32px;
+      /* Jarak kosong di atas Tanda Tangan saat di HP */
+      --signature-box-width: 340px;
+      /* Lebar spesifik masing-masing bingkai kotak Tanda Tangan */
+      --signature-box-height: 176px;
+      /* Tinggi dari kotak Tanda Tangan tersebut */
+      --signature-box-radius: 8px;
+      /* Lengkungan sudut untuk kotak Tanda Tangan */
+      --signature-title-padding: 12px;
+      /* Jarak tebal ruangan untuk judul "Dibuat Oleh" di dalam kotaknya */
+      --signature-body-padding: 10px 15px;
+      /* Ruang untuk tanda tangan basah dan nama */
+      --signature-content-gap: 10px;
+      /* Jarak kosong antara tanda tangan basah dan nama terang di bawahnya */
+      --signature-preview-min-height: 82px;
+      /* Tinggi batas untuk gambar coretan tanda tangan agar tidak menabrak teks */
+      --signature-image-max-height: 78px;
+      /* Ukuran tinggi maksimal jika Anda meletakkan gambar (img) tanda tangan digital */
+      --signature-image-max-width: 220px;
+      /* Ukuran lebar maksimal gambar tanda tangan digital */
+      --signature-name-width: 105px;
+      /* Lebar khusus untuk garis nama terang di bawah */
+      --signature-line-height: 18px;
+      /* Tinggi baris khusus untuk nama orang di dalam kotak */
+      --signature-name-padding-inline: 4px;
+      /* Ruang bernapas di pinggir teks nama orang */
+
+      /* =========================
+     Maintenance: Print Button
+     ========================= */
+      --print-button-bottom: 30px;
+      /* Jarak tombol melayang "Print Halaman" dari tepi layar BAWAH */
+      --print-button-right: 30px;
+      /* Jarak tombol "Print Halaman" dari tepi layar KANAN */
+      --print-button-bottom-mobile: 20px;
+      /* Jarak tombol print dari tepi bawah saat di HP */
+      --print-button-right-mobile: 20px;
+      /* Jarak tombol print dari tepi kanan saat di HP */
+      --print-button-padding: 14px 28px;
+      /* Ruang dalam (tebal dan panjang) tombol Print */
+      --print-button-padding-mobile: 12px 24px;
+      /* Ruang dalam tombol Print saat di HP */
+      --print-button-gap: 10px;
+      /* Jarak antara Icon Printer dengan Tulisan "Print" di dalam tombol */
+      --print-button-radius: 50px;
+      /* Efek melengkung kapsul bundar (pill) untuk tombol Print */
+      --print-button-icon-size: 20px;
+      /* Ukuran lebar x tinggi untuk ikon printer */
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: var(--font-family-base);
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      line-height: 1.5;
+      padding: var(--page-padding-desktop);
+      display: flex;
+      justify-content: center;
+    }
+
+    @media print {
+      body {
+        background-color: white;
+        padding: 0;
+      }
+
+      .report-container {
+        box-shadow: none !important;
+        border: none !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        padding: var(--report-padding-print) !important;
+      }
+
+      .table-container {
+        overflow: visible !important;
+        overflow-x: visible !important;
+      }
+
+      .no-print {
+        display: none !important;
+      }
+
+      tr {
+        page-break-inside: avoid;
+      }
+
+      .signature-box {
+        width: var(--signature-width);
+        max-width: var(--signature-width);
+        height: 170px;
+        border: 1px solid var(--table-border-color);
+        border-radius: 6px;
+        display: inline-block;
+        background-color: var(--surface-color);
+        text-align: left;
+        position: relative;
+      }
+    }
+
+    @media screen and (max-width: 768px) {
+      body {
+        padding: var(--page-padding-tablet);
+      }
+
+      .report-container {
+        padding: var(--report-padding-tablet);
+        border-radius: var(--report-radius-mobile);
+      }
+
+      .header {
+        flex-direction: column;
+        gap: var(--header-gap-mobile);
+        align-items: flex-start;
+      }
+
+      .header-company {
+        max-width: none;
+        width: 100%;
+        text-align: left;
+      }
+
+      .company-address-line {
+        white-space: normal;
+      }
+
+      .report-heading h1 {
+        font-size: var(--font-size-report-title-tablet);
+      }
+
+      .report-info {
+        padding: var(--report-info-padding-mobile);
+      }
+
+      .info-grid {
+        grid-template-columns: 1fr;
+        width: 100%;
+        row-gap: var(--report-info-row-gap-mobile);
+      }
+
+      .info-column {
+        row-gap: var(--report-info-row-gap-mobile);
+      }
+
+      .info-item {
+        display: contents;
+      }
+
+      .info-column:nth-child(1),
+      .info-column:nth-child(2),
+      .info-column:nth-child(3) {
+        margin-left: 0;
+      }
+
+      .signatures {
+        flex-direction: column;
+        gap: var(--signature-gap-mobile);
+        align-items: stretch;
+        margin-top: var(--signature-margin-top-mobile);
+      }
+
+      .signature-box {
+        width: 100%;
+        max-width: none;
+      }
+
+      .print-btn {
+        bottom: var(--print-button-bottom-mobile);
+        right: var(--print-button-right-mobile);
+        padding: var(--print-button-padding-mobile);
+        font-size: var(--font-size-print-button-mobile);
+      }
+    }
+
+    @media screen and (max-width: 480px) {
+      .report-container {
+        padding: var(--report-padding-mobile);
+      }
+
+      .report-heading h1 {
+        font-size: var(--font-size-report-title-mobile);
+      }
+
+      .info-item {
+        grid-template-columns: var(--report-info-label-width-mobile) var(--report-info-colon-width) minmax(0, 1fr);
+      }
+    }
+
+    .report-container {
+      background-color: var(--surface-color);
+      width: 100%;
+      max-width: var(--report-max-width);
+      padding: var(--report-padding-desktop);
+      border-radius: var(--report-radius-desktop);
+      box-shadow: 0 20px 40px rgba(15, 23, 42, 0.06);
+      border: 1px solid var(--border-color);
+    }
+
+    [contenteditable="true"] {
+      outline: none;
+      border-radius: var(--editable-radius);
+      transition: all 0.2s ease;
+    }
+
+    [contenteditable="true"]:hover,
+    [contenteditable="true"]:focus {
+      background-color: var(--surface-table-head-color);
+      box-shadow: 0 0 0 3px var(--surface-table-head-color);
+      cursor: text;
+    }
+
+    @media print {
+
+      [contenteditable="true"],
+      [contenteditable="true"]:hover,
+      [contenteditable="true"]:focus {
+        background-color: transparent !important;
+        box-shadow: none !important;
+      }
+    }
+
+    /* =========================
+   Header Section
+   Logo/app kiri dan identitas perusahaan kanan.
+   ========================= */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: var(--header-gap);
+    }
+
+    .header-brand {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .header-logo {
+      width: var(--header-logo-width);
+    }
+
+    .header-logo-frame {
+      width: 100%;
+      min-height: var(--header-logo-max-height);
+      overflow: visible;
+      display: flex;
+      align-items: center;
+    }
+
+    .header-logo-frame img {
+      display: inline-block;
+      width: auto;
+      max-width: 100%;
+      max-height: var(--header-logo-max-height);
+      height: auto;
+      object-fit: contain;
+      object-position: left center;
+    }
+
+    .header-company {
+      max-width: var(--header-company-max-width);
+      text-align: right;
+    }
+
+    .company-name {
+      font-size: var(--font-size-company-name);
+      font-weight: 700;
+      color: var(--primary-color);
+      line-height: 1.3;
+    }
+
+    .company-address {
+      margin-top: var(--company-address-margin-top);
+      font-size: var(--font-size-company-address);
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .company-address-line {
+      display: block;
+      white-space: nowrap;
+    }
+
+    .header-divider {
+      height: 0;
+      margin: var(--header-divider-margin);
+      border-top: 1px solid var(--table-border-color);
+    }
+
+    .report-heading {
+      margin: 0 0 var(--report-heading-margin-bottom);
+    }
+
+    .report-heading h1 {
+      font-size: var(--font-size-report-title-desktop);
+      font-weight: 700;
+      color: var(--primary-color);
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    /* =========================
+   Report Info Box
+   Kiri = identitas sesi, kanan = total summary.
+   ========================= */
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      justify-content: start;
+      width: 100%;
+      max-width: 100%;
+      column-gap: var(--report-info-column-gap);
+      row-gap: var(--report-info-row-gap);
+    }
+
+    .info-column {
+      display: grid;
+      grid-template-columns: max-content var(--report-info-colon-width) 1fr;
+      grid-auto-rows: minmax(var(--report-info-item-min-height), auto);
+      row-gap: var(--report-info-row-gap);
+      column-gap: var(--report-info-item-gap);
+      align-content: start;
+      align-items: center;
+    }
+
+    .info-column:nth-child(1) {
+      margin-left: var(--report-info-offset-col1);
+    }
+
+    .info-column:nth-child(2) {
+      margin-left: var(--report-info-offset-col2);
+    }
+
+    .info-column:nth-child(3) {
+      margin-left: var(--report-info-offset-col3);
+    }
+
+    .report-info {
+      width: 100%;
+      margin-bottom: var(--report-info-margin-bottom);
+      background-color: var(--surface-soft-color);
+      padding: var(--report-info-padding);
+      border-radius: var(--panel-radius);
+      border: 1px solid var(--border-color);
+    }
+
+    .info-item {
+      display: contents;
+    }
+
+    .info-label {
+      font-weight: 600;
+      color: var(--secondary-color);
+      font-size: var(--font-size-info-label);
+      text-align: left;
+    }
+
+    .info-value {
+      font-weight: 700;
+      color: var(--text-main);
+      font-size: var(--font-size-info-value);
+      text-align: left;
+    }
+
+    .info-value--nowrap {
+      white-space: nowrap;
+      word-break: keep-all;
+      overflow-wrap: normal;
+    }
+
+    .info-colon {
+      margin: 0;
+      color: var(--secondary-color);
+      text-align: center;
+    }
+
+    /* =========================
+   Table Section
+   Header tabel dan body tabel dipisah jelas untuk maintenance.
+   ========================= */
+    .table-container {
+      margin-bottom: var(--table-margin-bottom);
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: var(--font-size-table-body);
+      border: 1px solid var(--table-border-color);
+    }
+
+    th,
+    td {
+      border: 1px solid var(--table-border-color);
+      vertical-align: var(--table-cell-vertical-align);
+    }
+
+    /* Header tabel: judul kolom. */
+    th {
+      padding: var(--table-header-cell-padding);
+      background-color: var(--surface-table-head-color);
+      color: #000;
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: var(--font-size-table-header);
+      letter-spacing: var(--table-header-letter-spacing);
+      white-space: normal;
+      line-height: var(--table-header-line-height);
+      text-align: center !important;
+      min-height: var(--table-header-row-height);
+      height: var(--table-header-row-height);
+    }
+
+    /* ==========================================================================
+       PENGATURAN KOLOM TABEL (COLUMN STYLING)
+       Menggunakan th:nth-child() untuk mengatur lebar dan alignment header,
+       dan td:nth-child() untuk mengatur alignment isi kolom.
+       ========================================================================== */
+
+    /* --- KOLOM 1: No --- */
+    th:nth-child(1) {
+      width: 4%;
+      text-align: center !important;
+    }
+
+    td:nth-child(1) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 2: Driver Name --- */
+    th:nth-child(2) {
+      width: 16%;
+      text-align: center !important;
+    }
+
+    td:nth-child(2) {
+      text-align: left !important;
+    }
+
+    /* --- KOLOM 3: Plate No. --- */
+    th:nth-child(3) {
+      width: 12%;
+      text-align: center !important;
+    }
+
+    td:nth-child(3) {
+      text-align: center !important;
+      white-space: nowrap;
+    }
+
+    /* --- KOLOM 4: Vehicle Type --- */
+    th:nth-child(4) {
+      width: 14%;
+      text-align: center !important;
+    }
+
+    td:nth-child(4) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 5: Container No. --- */
+    th:nth-child(5) {
+      width: 11%;
+      text-align: center !important;
+    }
+
+    td:nth-child(5) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 6: Pallet No. --- */
+    th:nth-child(6) {
+      width: 11%;
+      text-align: center !important;
+    }
+
+    td:nth-child(6) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 7: Actual Qty --- */
+    th:nth-child(7) {
+      width: 10%;
+      text-align: center !important;
+    }
+
+    td:nth-child(7) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 8: SJ Qty --- */
+    th:nth-child(8) {
+      width: 10%;
+      text-align: center !important;
+    }
+
+    td:nth-child(8) {
+      text-align: center !important;
+    }
+
+    /* --- KOLOM 9: Variance --- */
+    th:nth-child(9) {
+      width: 10%;
+      text-align: center !important;
+    }
+
+    td:nth-child(9) {
+      text-align: center !important;
+    }
+
+    /* Body tabel: isi data per baris. */
+    td {
+      padding: var(--table-body-cell-padding);
+      color: var(--text-main);
+      font-weight: 500;
+      min-height: var(--table-body-row-height);
+      height: var(--table-body-row-height);
+    }
+
+    tbody tr:nth-child(even) {
+      background-color: var(--table-row-alt-color);
+    }
+
+    tbody tr:hover {
+      background-color: var(--table-row-hover-color);
+    }
+
+    /* =========================
+   Signature Section
+   Kotak tanda tangan final report.
+   ========================= */
+    .signatures {
+      display: flex;
+      justify-content: center;
+      gap: var(--signature-gap);
+      margin-top: var(--signature-margin-top);
+    }
+
+    .signature-box {
+      width: var(--signature-box-width);
+      border: 1px solid var(--table-border-color);
+      border-radius: var(--signature-box-radius);
+      display: flex;
+      flex-direction: column;
+      height: var(--signature-box-height);
+      background-color: var(--surface-color);
+    }
+
+    .signature-title {
+      font-weight: 700;
+      color: var(--text-main);
+      font-size: var(--font-size-signature-title);
+      text-align: center;
+      padding: var(--signature-title-padding);
+      border-bottom: 1px solid var(--table-border-color);
+      background-color: var(--surface-soft-color);
+      border-top-left-radius: var(--signature-box-radius);
+      border-top-right-radius: var(--signature-box-radius);
+    }
+
+    .signature-bottom {
+      display: flex;
+      flex: 1;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: var(--signature-content-gap);
+      padding: var(--signature-body-padding);
+    }
+
+    .signature-preview {
+      min-height: var(--signature-preview-min-height);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .signature-preview--empty {
+      justify-content: center;
+    }
+
+    .signature-image {
+        display: inline-block;
+        vertical-align: middle;
+        width: auto;
+        max-width: 130px;
+        max-height: var(--signature-image-max-height);
+        object-fit: contain;
+      }
+
+    .signature-meta {
+        position: absolute;
+        bottom: 8px;
+        left: 12px;
+        right: 12px;
+        font-size: var(--signature-meta-font);
+      }
+
+    .signature-field {
+      display: flex;
+      align-items: flex-end;
+      gap: 5px;
+    }
+
+    .signature-line {
+      width: var(--signature-name-width);
+      border-bottom: 1px solid var(--text-main);
+      height: var(--signature-line-height);
+    }
+
+    .signature-name-filled {
+      font-weight: 700;
+      font-size: var(--font-size-signature-body);
+      color: var(--text-main);
+      min-width: var(--signature-name-width);
+      border-bottom: 1px solid var(--text-main);
+      display: inline-block;
+      text-align: center;
+      padding: 0 var(--signature-name-padding-inline);
+    }
+
+    /* =========================
+   Print Button
+   Tombol cetak floating di layar.
+   ========================= */
+    .print-btn {
+      position: fixed;
+      bottom: var(--print-button-bottom);
+      right: var(--print-button-right);
+      background-color: #2563eb;
+      color: white;
+      border: none;
+      border-radius: var(--print-button-radius);
+      padding: var(--print-button-padding);
+      font-family: var(--font-family-base);
+      font-weight: 600;
+      font-size: var(--font-size-print-button);
+      cursor: pointer;
+      box-shadow: 0 10px 20px rgba(37, 99, 235, 0.3);
+      display: flex;
+      align-items: center;
+      gap: var(--print-button-gap);
+      transition: all 0.3s ease;
+      z-index: 100;
+    }
+
+    .print-btn:hover {
+      background-color: #1d4ed8;
+      transform: translateY(-2px);
+      box-shadow: 0 12px 24px rgba(37, 99, 235, 0.4);
+    }
+
+    .print-btn svg {
+      width: var(--print-button-icon-size);
+      height: var(--print-button-icon-size);
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="report-container">
+    <!-- Header report: logo di kiri, identitas perusahaan di kanan. -->
+    <div class="header">
+      <div class="header-brand">
+        <div class="header-logo">
+          <div class="header-logo-frame">
+            <? if (data.config.logoDataUri || data.config.logoFileId) { ?>
+              <img
+                id="logo-img"
+                src="<?!= data.config.logoDataUri || ('https://lh3.googleusercontent.com/d/' + data.config.logoFileId) ?>"
+                alt="Logo Perusahaan"
+                style="display: inline-block;width:auto;max-width:180px;max-height:48px;height:auto;object-fit:contain;object-position:left center;"
+                onerror="tryFallbackDriveImage(this, '<?= data.config.logoFileId ?>')"
+              >
+            <? } ?>
+          </div>
+        </div>
+      </div>
+      <div class="header-company">
+        <div class="company-name">PT Sociolla Bella Indonesia</div>
+        <div class="company-address">
+          <span class="company-address-line">Kavling Blok W01 Griya Idola Industrial Park, Jl. Raya Serang</span>
+          <span class="company-address-line">Km.12, Bitung Jaya, Kec. Cikupa, Tangerang,</span>
+          <span class="company-address-line">Banten 15710</span>
+        </div>
+      </div>
+    </div>
+    <div class="header-divider"></div>
+    <!-- Judul dokumen handover/report. -->
+    <div class="report-heading">
+      <h1><?= (data.config.title && String(data.config.title).trim().toUpperCase() !== 'LOGISTICS DATA MANIFEST') ? data.config.title : 'UNLOADING REPORT B2B' ?></h1>
+    </div>
+
+    <!-- ============================
+         INFO GRID - Data Sesi & Summary Otomatis
+         GAS tetap dipertahankan:
+         - data.session.brand / shipment / date / forwarder
+         - data.summary sebagai nilai awal
+         - calculateTotals() akan menghitung ulang dari tabel setelah halaman dimuat
+         Layout preview:
+         1) Brand, Shipment, Inbound Date
+         2) Forwarder, Total Container, Total Pallet
+         3) Total Koli Aktual, Total Koli SJ, Selisih Koli
+         ============================ -->
+    <div class="report-info">
+      <div class="info-grid">
+        <div class="info-column">
+          <div class="info-item">
+            <span class="info-label">Brand</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.session.brand ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Shipment</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.session.shipment ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Inbound Date</span>
+            <span class="info-colon">:</span>
+            <span class="info-value info-value--nowrap" style="white-space:nowrap;word-break:keep-all;overflow-wrap:normal;" contenteditable="true"><?= data.session.inboundDate || data.session.date ?></span>
+          </div>
+        </div>
+
+        <div class="info-column">
+          <div class="info-item">
+            <span class="info-label">Forwarder</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.session.forwarder || '-' ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Total Container</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.summary.totalFleet ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Total Pallet</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.summary.totalPalet ?></span>
+          </div>
+        </div>
+
+        <div class="info-column">
+          <div class="info-item">
+            <span class="info-label">Total Koli Aktual</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.summary.totalActualQty || data.summary.totalKoli || 0 ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Total Koli SJ</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.summary.totalSjQty || data.summary.totalSJQty || data.summary.totalKoliSJ || 0 ?></span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Selisih Koli</span>
+            <span class="info-colon">:</span>
+            <span class="info-value" contenteditable="true"><?= data.summary.totalVariance || data.summary.varianceQty || 0 ?></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================
+         TABEL - 1 baris per PALET (atau 1 baris per armada jika tidak ada palet)
+         Maintenance:
+         - Font header tabel: --font-size-table-header
+         - Font isi/body tabel: --font-size-table-body
+         - Alignment/lebar kolom diatur di CSS nth-child dari desain preview
+
+         Backend mengisi palet.sjQty dan palet.variance dari sheet SJ_QTY.
+         ============================ -->
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 50px; text-align: center;">No</th>
+            <th>Driver Name</th>
+            <th>Plate No.</th>
+            <th>Vehicle Type</th>
+            <th>Container No.</th>
+            <th>Pallet No.</th>
+            <th>Actual Qty</th>
+            <th>SJ Qty</th>
+            <th>Variance</th>
+          </tr>
+        </thead>
+        <tbody>
+          <? var no = 0; ?>
+          <? data.fleets.forEach(function(fleet) { ?>
+            <? if (fleet.paletDetails && fleet.paletDetails.length > 0) { ?>
+              <? fleet.paletDetails.forEach(function(palet) { ?>
+                <? no++; ?>
+                <? var actualQty = (palet.actualQty !== undefined && palet.actualQty !== null && palet.actualQty !== '') ? palet.actualQty : palet.koli; ?>
+                <? var sjQty = (palet.sjQty !== undefined && palet.sjQty !== null && palet.sjQty !== '') ? palet.sjQty : ((palet.qtySj !== undefined && palet.qtySj !== null && palet.qtySj !== '') ? palet.qtySj : ((palet.sjKoli !== undefined && palet.sjKoli !== null && palet.sjKoli !== '') ? palet.sjKoli : ((palet.koliSj !== undefined && palet.koliSj !== null && palet.koliSj !== '') ? palet.koliSj : ''))); ?>
+                <? var varianceQty = (palet.variance !== undefined && palet.variance !== null && palet.variance !== '') ? palet.variance : ((sjQty !== '') ? (Number(actualQty || 0) - Number(sjQty || 0)) : ''); ?>
+                <tr>
+                  <td contenteditable="true"><?= no ?></td>
+                  <td contenteditable="true"><?= fleet.driver ?></td>
+                  <td contenteditable="true"><?= fleet.plate ?></td>
+                  <td contenteditable="true"><?= fleet.type || '-' ?></td>
+                  <td contenteditable="true"><?= fleet.number ?></td>
+                  <td contenteditable="true"><?= palet.displayName || palet.name ?></td>
+                  <td contenteditable="true"><?= actualQty ?></td>
+                  <td contenteditable="true"><?= sjQty ?></td>
+                  <td contenteditable="true"><?= varianceQty ?></td>
+                </tr>
+              <? }); ?>
+            <? } else { ?>
+                <? no++; ?>
+                <? var actualQtyFleet = (fleet.actualQty !== undefined && fleet.actualQty !== null && fleet.actualQty !== '') ? fleet.actualQty : (fleet.qtyKoli || ''); ?>
+                <? var sjQtyFleet = (fleet.sjQty !== undefined && fleet.sjQty !== null && fleet.sjQty !== '') ? fleet.sjQty : ((fleet.qtySj !== undefined && fleet.qtySj !== null && fleet.qtySj !== '') ? fleet.qtySj : ((fleet.sjKoli !== undefined && fleet.sjKoli !== null && fleet.sjKoli !== '') ? fleet.sjKoli : ((fleet.koliSj !== undefined && fleet.koliSj !== null && fleet.koliSj !== '') ? fleet.koliSj : ''))); ?>
+                <? var varianceQtyFleet = (fleet.variance !== undefined && fleet.variance !== null && fleet.variance !== '') ? fleet.variance : ((sjQtyFleet !== '') ? (Number(actualQtyFleet || 0) - Number(sjQtyFleet || 0)) : ''); ?>
+                <tr>
+                  <td contenteditable="true"><?= no ?></td>
+                  <td contenteditable="true"><?= fleet.driver ?></td>
+                  <td contenteditable="true"><?= fleet.plate ?></td>
+                  <td contenteditable="true"><?= fleet.type || '-' ?></td>
+                  <td contenteditable="true"><?= fleet.number ?></td>
+                  <td contenteditable="true" style="color:#94a3b8; font-style:italic;">-</td>
+                  <td contenteditable="true"><?= actualQtyFleet ?></td>
+                  <td contenteditable="true"><?= sjQtyFleet ?></td>
+                  <td contenteditable="true"><?= varianceQtyFleet ?></td>
+                </tr>
+            <? } ?>
+          <? }); ?>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ============================
+         TANDA TANGAN
+         Maintenance:
+         - signatureLeft / signatureRight = judul kotak tanda tangan
+         - Pic Unloading = otomatis dari data sesi + bisa ambil Signature File ID dari Accounts
+         - Loss Prevention = nama + tanggal otomatis, tanda tangan tetap manual
+         Pic Unloading → OTOMATIS (nama + tanggal dari data sesi)
+         Loss Prevention → MANUAL (kosong, diisi tangan)
+         
+         GAS:
+         Pic Unloading Name: <?= data.session.pic ?>
+         Pic Unloading Date: <?= data.session.date ?>
+         ============================ -->
+    <div class="signatures">
+      <div class="signature-box">
+        <div class="signature-title"><?= data.config.signatureLeft ?></div>
+        <div class="signature-bottom">
+          <? if (data.session.picSignatureFileId) { ?>
+            <div class="signature-preview">
+              <img
+                class="signature-image"
+                src="<?!= data.session.picSignatureDataUri || ('https://lh3.googleusercontent.com/d/' + data.session.picSignatureFileId) ?>"
+                alt="Tanda Tangan <?= data.session.pic ?>"
+                style="display:block;width:auto;max-width:220px;max-height:78px;height:auto;object-fit:contain;"
+                onerror="tryFallbackDriveImage(this, '<?= data.session.picSignatureFileId ?>')"
+              >
+            </div>
+          <? } else { ?>
+            <div class="signature-preview signature-preview--empty"></div>
+          <? } ?>
+          <div class="signature-meta">
+            <div class="signature-field">Name: <span class="signature-name-filled" contenteditable="true"><?= data.session.pic ?></span></div>
+            <div class="signature-field">Date: <span class="signature-name-filled" contenteditable="true"><?= data.session.date ?></span></div>
+          </div>
+        </div>
+      </div>
+      <div class="signature-box">
+        <div class="signature-title"><?= data.config.signatureRight ?></div>
+        <div class="signature-bottom">
+          <? if (data.session.lossPreventionSignatureFileId) { ?>
+            <div class="signature-preview">
+              <img
+                class="signature-image"
+                src="<?!= data.session.lossPreventionSignatureDataUri || ('https://lh3.googleusercontent.com/d/' + data.session.lossPreventionSignatureFileId) ?>"
+                alt="Tanda Tangan <?= data.session.lossPreventionName ?>"
+                style="display:block;width:auto;max-width:220px;max-height:78px;height:auto;object-fit:contain;"
+                onerror="tryFallbackDriveImage(this, '<?= data.session.lossPreventionSignatureFileId ?>')"
+              >
+            </div>
+          <? } else { ?>
+            <div class="signature-preview signature-preview--empty"></div>
+          <? } ?>
+          <div class="signature-meta">
+            <div class="signature-field">Name: <? if (data.session.lossPreventionName) { ?><span class="signature-name-filled" contenteditable="true"><?= data.session.lossPreventionName ?></span><? } else { ?><div class="signature-line"></div><? } ?></div>
+            <? var lpSignatureDate = data.session.lossPreventionSignatureSignedAt || data.session.lossPreventionDate; ?>
+            <div class="signature-field">Date: <? if (lpSignatureDate) { ?><span class="signature-name-filled" contenteditable="true"><?= lpSignatureDate ?></span><? } else { ?><div class="signature-line"></div><? } ?></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <button class="print-btn no-print" onclick="window.print()">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+      <polyline points="6 9 6 2 18 2 18 9"></polyline>
+      <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+      <rect x="6" y="14" width="12" height="8"></rect>
+    </svg>
+    Cetak Laporan
+  </button>
+  <script>
+    function parseQty(value) {
+      var normalized = String(value == null ? '' : value)
+        .replace(/\s+/g, '')
+        .replace(/,/g, '.')
+        .replace(/[^0-9.\-]/g, '');
+      var num = parseFloat(normalized);
+      return isNaN(num) ? 0 : num;
+    }
+
+    function updateInfoValue(labelName, nextValue) {
+      var infoItems = document.querySelectorAll('.info-item');
+      infoItems.forEach(function(item) {
+        var label = item.querySelector('.info-label');
+        var value = item.querySelector('.info-value');
+        if (!label || !value) return;
+        if (label.textContent.trim() === labelName) {
+          var textValue = String(nextValue);
+          if (value.textContent.trim() !== textValue) value.textContent = textValue;
+        }
+      });
+    }
+
+    function calculateTotals() {
+      var tbody = document.querySelector('table tbody');
+      if (!tbody) return;
+
+      var rows = tbody.querySelectorAll('tr');
+      var totalActual = 0;
+      var totalSJ = 0;
+      var containers = new Set();
+      var pallets = new Set();
+
+      rows.forEach(function(row) {
+        var cells = row.querySelectorAll('td');
+        if (cells.length < 9) return;
+
+        var containerNo = cells[4].textContent.trim();
+        if (containerNo && containerNo !== '-') containers.add(containerNo);
+
+        var palletNo = cells[5].textContent.trim();
+        if (palletNo && palletNo !== '-') pallets.add(palletNo);
+
+        var actual = parseQty(cells[6].textContent);
+        var sj = parseQty(cells[7].textContent);
+        var variance = actual - sj;
+
+        var varianceText = String(variance);
+        if (cells[8].textContent.trim() !== varianceText) {
+          cells[8].textContent = varianceText;
+        }
+
+        totalActual += actual;
+        totalSJ += sj;
+      });
+
+      updateInfoValue('Total Container', containers.size);
+      updateInfoValue('Total Pallet', pallets.size);
+      updateInfoValue('Total Koli Aktual', totalActual);
+      updateInfoValue('Total Koli SJ', totalSJ);
+      updateInfoValue('Selisih Koli', totalActual - totalSJ);
+    }
+
+    function tryFallbackDriveImage(img, id) {
+      if (!img.dataset.retried) {
+        img.dataset.retried = 'true';
+        img.src = 'https://drive.google.com/uc?export=view&id=' + id;
+        return;
+      }
+      img.style.display = 'none';
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+      calculateTotals();
+
+      var tbody = document.querySelector('table tbody');
+      if (tbody) {
+        tbody.addEventListener('input', function(event) {
+          var targetCell = event.target.closest('td');
+          if (!targetCell) return;
+          var cellIndex = Array.prototype.indexOf.call(targetCell.parentNode.children, targetCell);
+          // Recalculate saat Container, Pallet, Actual Qty, atau SJ Qty diedit.
+          if (cellIndex >= 4 && cellIndex <= 7) calculateTotals();
+        });
+      }
+    });
+  </script>
+</body>
+</html>

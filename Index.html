@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>InLens</title>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <?!= include('Styles'); ?>
+</head>
+<body>
+
+<div id="offline-banner" class="offline-banner" role="alert" aria-live="assertive">
+  <span>Tidak ada koneksi internet</span>
+  <button onclick="location.reload()" aria-label="Muat ulang halaman">Coba lagi</button>
+</div>
+
+<!-- ===== INLENS LOGIN PAGE ===== -->
+<div id="login-page" class="login-wrapper">
+  <div class="login-container">
+    <div class="login-header">
+      <h1>Welcome to InLens!</h1>
+      <p>Keep your data safe</p>
+    </div>
+
+    <form class="login-form" onsubmit="event.preventDefault(); handleLogin();" role="form" aria-label="Login">
+      <!-- Username -->
+      <div class="input-pill">
+        <input type="text" id="login-user" class="input-field" placeholder=" " required autocomplete="username" oninput="validateLoginInputs()">
+        <label for="login-user">Username</label>
+      </div>
+
+      <!-- Password -->
+      <div class="input-pill">
+        <input type="password" id="login-pass" class="input-field has-toggle" placeholder=" " required autocomplete="current-password" oninput="validateLoginInputs()">
+        <label for="login-pass">Password</label>
+        <button type="button" class="toggle-password" onclick="togglePassword()" aria-label="Toggle password visibility">
+          <svg id="eye-off-icon" viewBox="0 0 24 24"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+          <svg id="eye-icon" viewBox="0 0 24 24" style="display:none;"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        </button>
+      </div>
+
+      <div id="login-error" class="login-error"></div>
+      <button type="submit" id="btn-login" class="login-btn" disabled>LOGIN</button>
+    </form>
+
+    <div class="version-label">Versi 5.0.0 (Build 2026)</div>
+  </div>
+</div>
+
+
+
+<div id="app-shell" class="app-shell">
+  <div id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+      <span class="sidebar-brand" id="sidebar-brand-text">InLens</span>
+    </div>
+    <div class="sidebar-section">Utama</div>
+    <div class="sidebar-item active" data-page="dashboard" onclick="navigateTo('dashboard')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      <span class="item-label">Sesi Aktif</span>
+    </div>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Sesi</div>
+    <div class="sidebar-item" data-page="newsession" onclick="navigateTo('newsession')">
+      <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      <span class="item-label">Sesi baru</span>
+    </div>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Laporan</div>
+    <div class="sidebar-item" data-page="history" onclick="navigateTo('history')">
+      <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+      <span class="item-label">Riwayat</span>
+    </div>
+    <div class="sidebar-footer" id="sidebar-version">v5.0.0</div>
+  </div>
+
+  <div class="content-area">
+    <div class="topbar">
+      <button class="btn-hamburger" onclick="toggleSidebar()">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <span class="topbar-title" id="topbar-title">Sesi Aktif</span>
+      <span class="topbar-info" id="topbar-info"></span>
+      <div class="topbar-spacer"></div>
+      <div class="user-chip" onclick="toggleUserDropdown(event)">
+        <div class="user-avatar" id="user-avatar">BD</div>
+        <span class="user-name" id="user-name-display">Budi</span>
+      </div>
+    </div>
+    <div class="user-dropdown" id="user-dropdown">
+      <div class="user-dropdown-header">
+        <p id="dd-username">Budi</p>
+        <small id="dd-role">Staff</small>
+      </div>
+      <div class="user-dropdown-item danger" onclick="handleLogout()">
+        <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        Logout
+      </div>
+    </div>
+    <div class="mobile-topbar">
+      <div class="mlogo"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+      <span class="mtitle" id="mobile-title">Sesi Aktif</span>
+    </div>
+
+    <div class="content-body" id="content-body">
+      <div id="page-dashboard" class="page active"><div id="dashboard-content">Memuat...</div></div>
+      <div id="page-session" class="page" style="padding:0;height:100%;">
+        <div class="split-view" id="split-view">
+          <div class="split-list" id="split-list"></div>
+          <div class="split-detail" id="split-detail"><div class="empty-state"><p>Pilih armada dari daftar</p></div></div>
+        </div>
+      </div>
+      <div id="page-newsession" class="page">
+        <div class="form-section">
+          <h3>Sesi baru</h3>
+          <p class="sub">Buat sesi unloading baru</p>
+          <div class="fg"><label>Tanggal</label><input type="date" id="in-date" class="fi"></div>
+          <div class="fg">
+            <label>Brand / Merek
+            </label>
+            <select id="in-brand" class="fi"><option value="">Memuat...</option></select>
+          </div>
+          <div class="fg"><label>Shipment</label><input type="text" id="in-shipment" class="fi" placeholder="Contoh: SHP-001" style="text-transform:uppercase;"></div>
+          <div class="fg"><label>Forwarder</label><input type="text" id="in-forwarder" class="fi" placeholder="Contoh: PT. Logistik Maju Jaya"></div>
+          <button class="btn-primary" onclick="handleCreateSession()">Buat sesi</button>
+        </div>
+      </div>
+      <div id="page-history" class="page">
+        <h3 style="font-size:18px;font-weight:600;margin-bottom:4px;">Riwayat sesi</h3>
+        <p style="font-size:12px;color:#64748b;margin-bottom:16px;">Daftar sesi yang sudah selesai</p>
+        <div id="history-list">Memuat...</div>
+      </div>
+      <div id="page-profile" class="page" style="background:#f1f5f9;min-height:100%;padding-bottom:40px;margin:-12px;width:calc(100% + 24px);">
+        <div class="p-header-top">
+          <button class="btn-ph-back" onclick="navigateTo('dashboard')">
+            <svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+          </button>
+          More
+        </div>
+        <div class="profile-card">
+          <div class="p-card-header">
+            <div class="p-avatar-lg" id="p-avatar-lg">GA</div>
+            <div class="p-user-info">
+              <div class="p-name" id="p-user-name">User</div>
+              <div class="p-email" id="p-user-email">@user</div>
+            </div>
+          </div>
+        </div>
+        <div class="profile-card" style="padding:0">
+          <div class="p-menu-row">
+            <div style="display:flex;align-items:center"><svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Dark Mode</div>
+            <label class="tgl-switch"><input type="checkbox" id="dark-mode-toggle" onchange="toggleDarkMode()"><span class="tgl-slider"></span></label>
+          </div>
+        </div>
+        <div class="p-logout-card" onclick="handleLogout()">
+          <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          Logout
+        </div>
+      </div>
+    </div>
+
+    <div class="mobile-nav">
+      <div class="mnav-item active" data-page="dashboard" onclick="navigateTo('dashboard')">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        Sesi Aktif
+      </div>
+      <div class="mnav-item" data-page="newsession" onclick="navigateTo('newsession')">
+        <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Sesi baru
+      </div>
+      <div class="mnav-item" data-page="history" onclick="navigateTo('history')">
+        <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+        Riwayat
+      </div>
+      <div class="mnav-item" id="mnav-profile" data-page="profile" onclick="navigateTo('profile')">
+        <div class="mnav-avatar-circle" id="mnav-avatar-circle">BD</div>
+        Profil
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox" onclick="if(event.target.id==='lightbox'||event.target.className==='lb-close'){closeLightbox();}">
+  <button class="lb-close" type="button" aria-label="Tutup preview" onclick="closeLightbox()">&times;</button>
+  <div id="lightbox-wrapper">
+    <div class="lb-hint">Klik foto untuk zoom, klik area gelap untuk tutup</div>
+    <img src="" id="lightbox-img" alt="Preview" onclick="toggleLightboxZoom(event)">
+  </div>
+</div>
+<input type="file" id="file-camera" accept="image/*" capture="environment" style="display:none" onchange="handleMultiUploadV2(this)">
+<input type="file" id="file-gallery" accept="image/*" multiple style="display:none" onchange="handleMultiUploadV2(this)">
+
+<?!= include('UploadModule'); ?>
+
+    <?!= include('Logic_App'); ?>
+</body>
+</html>

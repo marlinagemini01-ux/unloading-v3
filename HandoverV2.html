@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <?
+    var reportData = data || {};
+    var session = reportData.session || {};
+    var summary = reportData.summary || {};
+    var fleets = reportData.fleets || [];
+    var config = reportData.config || {};
+
+    function valueOrEmpty_(value) {
+      return value === undefined || value === null ? "" : value;
+    }
+
+    function firstFilled_() {
+      for (var i = 0; i < arguments.length; i++) {
+        var value = arguments[i];
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return "";
+    }
+
+    function toNumber_(value) {
+      var numberValue = Number(value || 0);
+      return isNaN(numberValue) ? 0 : numberValue;
+    }
+
+    function formatSignatureDate_(value) {
+      if (value === undefined || value === null || value === "") return "";
+      var months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+      var raw = String(value || "").trim();
+      var isoMatch = raw.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+      if (isoMatch) {
+        var isoMonth = Number(isoMatch[2]);
+        if (isoMonth >= 1 && isoMonth <= 12) {
+          return ("0" + Number(isoMatch[3])).slice(-2) + " " + months[isoMonth - 1] + " " + isoMatch[1];
+        }
+      }
+      var dateValue = value instanceof Date ? value : new Date(raw);
+      if (!isNaN(dateValue.getTime())) {
+        return ("0" + dateValue.getDate()).slice(-2) + " " + months[dateValue.getMonth()] + " " + dateValue.getFullYear();
+      }
+      return raw;
+    }
+
+    var reportTitle = config.title || "UNLOADING REPORT B2B";
+    var logoFileId = config.logoFileId || "";
+    var logoSrc = config.logoDataUri || (logoFileId ? ("https://lh3.googleusercontent.com/d/" + logoFileId) : "");
+    var picSignatureFileId = session.picSignatureFileId || "";
+    var picSignatureSrc = session.picSignatureDataUri || (picSignatureFileId ? ("https://lh3.googleusercontent.com/d/" + picSignatureFileId) : "");
+    var lpSignatureFileId = session.lossPreventionSignatureFileId || "";
+    var lpSignatureSrc = session.lossPreventionSignatureDataUri || (lpSignatureFileId ? ("https://lh3.googleusercontent.com/d/" + lpSignatureFileId) : "");
+    var lpSignatureDate = session.lossPreventionSignatureSignedAt || session.lossPreventionDate || "";
+  ?>
+  <title>Handover V2 - <?= valueOrEmpty_(session.brand) ?> <?= valueOrEmpty_(session.shipment) ?></title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      /* Handover document visual source: handover-pdf-demo.html. */
+      --page-width: 210mm;
+      --page-min-height: 297mm;
+      --page-padding: 32px 20px;
+      --report-padding: 28px 32px;
+      --report-padding-print: 28px 32px;
+
+      /* Font */
+      --font-family: "Inter", system-ui, -apple-system, sans-serif;
+      --font-size-base: 12px;
+      --font-size-company-name: 15px;
+      --font-size-company-address: 11px;
+      --font-size-title: 20px;
+
+      /* Summary */
+      --summary-box-padding: 14px 20px;
+      --summary-inner-max-width: 96%;
+      --summary-col-gap: 32px;
+      --summary-row-gap: 6px;
+      --summary-font-size: 11px;
+      --summary-label-width: 92px;
+      --summary-colon-width: 10px;
+      --summary-value-gap: 4px;
+
+      /* Table */
+      --table-font-header: 9.5px;
+      --table-font-body: 11px;
+      --table-cell-padding: 5px 6px;
+      --table-header-padding: 6px 6px;
+
+      /* Signature */
+      --signature-width: 240px;
+      --signature-height: 160px;
+      --signature-gap: 32px;
+      --signature-cell-padding: 16px;
+      --signature-margin-top: 28px;
+      --signature-header-font: 12px;
+      --signature-meta-font: 11px;
+      --signature-label-width: 38px;
+      --signature-line-width: 150px;
+      --signature-image-max-height: 40px;
+
+      /* Colors */
+      --primary-color: #1e293b;
+      --secondary-color: #64748b;
+      --border-color: #e2e8f0;
+      --bg-color: #f1f5f9;
+      --surface-color: #ffffff;
+      --surface-soft-color: #f8fafc;
+      --surface-table-head: #f1f5f9;
+      --table-border-color: #cbd5e1;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+
+      --section-gap: 16px;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: var(--font-family);
+      font-size: var(--font-size-base);
+      color: var(--text-main);
+      background-color: var(--bg-color);
+      line-height: 1.5;
+      letter-spacing: 0;
+    }
+
+    .screen-preview {
+      display: flex;
+      justify-content: center;
+      padding: var(--page-padding);
+      min-width: var(--page-width);
+      overflow-x: auto;
+    }
+
+    .preview-workspace {
+      width: var(--page-width);
+      min-width: var(--page-width);
+      max-width: none;
+      display: grid;
+      gap: 10px;
+    }
+
+    .preview-toolbar {
+      position: sticky;
+      top: 10px;
+      z-index: 100;
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 8px 6px 12px;
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+      backdrop-filter: blur(8px);
+    }
+
+    .preview-toolbar__meta {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+      color: var(--primary-color);
+      font-size: 10px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .preview-toolbar__title {
+      font-weight: 800;
+    }
+
+    .preview-toolbar__subtext {
+      color: var(--text-muted);
+      font-weight: 700;
+    }
+
+    .preview-toolbar__actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+
+    .toolbar-button {
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0 10px;
+      font: 800 10px var(--font-family);
+      cursor: pointer;
+      letter-spacing: 0;
+    }
+
+    .toolbar-button--secondary {
+      background: var(--surface-color);
+      border-color: var(--border-color);
+      color: var(--primary-color);
+    }
+
+    .toolbar-button--secondary:hover {
+      background: var(--surface-soft-color);
+      border-color: var(--table-border-color);
+    }
+
+    .toolbar-button--primary {
+      background: var(--primary-color);
+      border-color: var(--primary-color);
+      color: #fff;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.14);
+    }
+
+    .toolbar-button--primary:hover {
+      background: #0f172a;
+      border-color: #0f172a;
+    }
+
+    .a4-wrapper {
+      width: var(--page-width);
+      max-width: none;
+      min-height: var(--page-min-height);
+      padding: var(--report-padding);
+      background-color: var(--surface-color);
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .header-left {
+      min-height: 35px;
+      display: flex;
+      align-items: center;
+      font-size: 22px;
+      font-weight: 700;
+      color: #d6124b;
+      letter-spacing: 0;
+    }
+
+    .header-logo {
+      display: block;
+      width: auto;
+      max-width: 178px;
+      max-height: 48px;
+      object-fit: contain;
+      object-position: left center;
+    }
+
+    .brand-text-logo {
+      font-size: 22px;
+      font-weight: 700;
+      color: #d6124b;
+      letter-spacing: 0;
+    }
+
+    .header-right {
+      max-width: 380px;
+      text-align: right;
+    }
+
+    .company-name {
+      font-size: var(--font-size-company-name);
+      font-weight: 700;
+      color: var(--primary-color);
+      line-height: 1.3;
+    }
+
+    .company-address {
+      margin-top: 3px;
+      font-size: var(--font-size-company-address);
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    .divider {
+      height: 1px;
+      margin-bottom: var(--section-gap);
+      background-color: var(--table-border-color);
+    }
+
+    .report-title {
+      margin-bottom: var(--section-gap);
+      color: var(--primary-color);
+      font-size: var(--font-size-title);
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .summary-box {
+      margin-bottom: var(--section-gap);
+      padding: var(--summary-box-padding);
+      background-color: var(--surface-soft-color);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: auto auto auto;
+      column-gap: var(--summary-col-gap);
+      align-items: center;
+      max-width: var(--summary-inner-max-width);
+      margin: 0 auto;
+    }
+
+    .summary-column {
+      display: flex;
+      flex-direction: column;
+      gap: var(--summary-row-gap);
+      min-width: 0;
+    }
+
+    .summary-row {
+      display: flex;
+      align-items: baseline;
+      font-size: var(--summary-font-size);
+      line-height: 1.5;
+    }
+
+    .summary-label {
+      width: var(--summary-label-width);
+      flex-shrink: 0;
+      color: var(--secondary-color);
+      font-weight: 600;
+      white-space: nowrap;
+      text-align: left;
+    }
+
+    .summary-colon {
+      width: var(--summary-colon-width);
+      flex-shrink: 0;
+      color: var(--secondary-color);
+      text-align: center;
+    }
+
+    .summary-value {
+      flex: 1;
+      min-width: 0;
+      margin-left: var(--summary-value-gap);
+      color: var(--text-main);
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: left;
+    }
+
+    .table-container {
+      margin-bottom: var(--section-gap);
+      border: 1px solid var(--table-border-color);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-size: var(--table-font-body);
+    }
+
+    th,
+    td {
+      border: 1px solid var(--table-border-color);
+      vertical-align: middle;
+    }
+
+    th {
+      padding: var(--table-header-padding);
+      background-color: var(--surface-table-head);
+      color: var(--primary-color);
+      font-size: var(--table-font-header);
+      font-weight: 700;
+      line-height: 1.3;
+      letter-spacing: 0;
+      text-align: center;
+      text-transform: uppercase;
+      white-space: normal;
+    }
+
+    td {
+      padding: var(--table-cell-padding);
+      color: var(--text-main);
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    td:nth-child(2) {
+      white-space: normal;
+      word-break: break-word;
+    }
+
+    td:nth-child(4) {
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      word-break: normal;
+      overflow-wrap: break-word;
+      line-height: 1.25;
+    }
+
+    th:nth-child(1), td:nth-child(1) { width: 4%; text-align: center; }
+    th:nth-child(2), td:nth-child(2) { width: 17%; text-align: left; }
+    th:nth-child(3), td:nth-child(3) { width: 13%; text-align: center; }
+    th:nth-child(4), td:nth-child(4) { width: 16%; text-align: center; }
+    th:nth-child(5), td:nth-child(5) { width: 10%; text-align: center; }
+    th:nth-child(6), td:nth-child(6) { width: 11%; text-align: center; }
+    th:nth-child(7), td:nth-child(7) { width: 10%; text-align: center; }
+    th:nth-child(8), td:nth-child(8) { width: 9%; text-align: center; }
+    th:nth-child(9), td:nth-child(9) { width: 10%; text-align: center; }
+
+    tbody tr:nth-child(even) {
+      background-color: var(--surface-soft-color);
+    }
+
+    .empty-state {
+      color: var(--text-muted);
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .signatures-wrapper {
+      display: block;
+      width: 100%;
+      margin: var(--signature-margin-top) 0 0;
+      padding: 0;
+      page-break-inside: avoid;
+    }
+    .signatures-wrapper::after {
+      content: "";
+      display: table;
+      clear: both;
+    }
+
+    .signature-slot {
+      display: block;
+      width: 35%;
+      box-sizing: border-box;
+      font-size: var(--signature-meta-font);
+    }
+    .signature-slot:first-child {
+      float: left;
+    }
+    .signature-slot:nth-child(2) {
+      float: right;
+    }
+
+    .signature-box {
+        display: block;
+        width: 100%;
+        height: 205px;
+        box-sizing: border-box;
+        border: 1px solid var(--table-border-color);
+        border-radius: 6px;
+        background-color: var(--surface-color);
+        text-align: left;
+        position: relative;
+      }
+
+    .signature-header {
+      background-color: var(--surface-table-head);
+      padding: 8px 10px;
+      text-align: center;
+      font-weight: 700;
+      font-size: var(--signature-header-font);
+      border-bottom: 1px solid var(--table-border-color);
+      border-radius: 6px 6px 0 0;
+      color: var(--primary-color);
+      height: 35px;
+      box-sizing: border-box;
+    }
+
+    .signature-body {
+        padding: 0 16px 16px 16px;
+        display: block;
+        height: 170px;
+        box-sizing: border-box;
+      }
+
+    .signature-space {
+        height: 95px;
+        margin-bottom: 11px;
+        padding-top: 25px;
+        box-sizing: border-box;
+        overflow: visible;
+        position: relative;
+        text-align: center;
+      }
+
+    .signature-image {
+        display: block;
+        margin: 0 auto;
+        width: auto;
+        max-width: 130px;
+        max-height: 65px;
+        object-fit: contain;
+      }
+
+    .meta-row {
+      position: relative;
+      height: 18px;
+    }
+    .meta-row-name {
+      margin-bottom: 12px;
+    }
+    .meta-label {
+      position: absolute;
+      left: 0;
+      bottom: 0;
+      width: 45px;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-align: left;
+    }
+    .meta-value {
+      position: absolute;
+      left: 45px;
+      right: 0;
+      bottom: 0;
+      border-bottom: 1px solid var(--text-main);
+      font-weight: 700;
+      color: var(--text-main);
+      text-align: center;
+      padding-bottom: 2px;
+    }
+
+    @media screen and (max-width: 720px) {
+      .screen-preview {
+        padding: 12px;
+      }
+
+      .preview-toolbar {
+        position: static;
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .preview-toolbar__meta {
+        justify-content: space-between;
+      }
+
+      .preview-toolbar__actions {
+        width: 100%;
+      }
+
+      .toolbar-button {
+        flex: 1;
+      }
+    }
+
+    @media print {
+      @page { size: A4 portrait; margin: 10mm 15mm 10mm 15mm; }
+
+      html,
+      body {
+        width: 210mm;
+        min-height: 297mm;
+        margin: 0 !important;
+        padding: 0 !important;
+        background-color: white !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      .screen-preview {
+        display: block;
+        padding: 0;
+      }
+
+      .preview-workspace {
+        width: 100%;
+        max-width: none;
+        display: block;
+      }
+
+      .no-print {
+        display: none !important;
+      }
+
+      .a4-wrapper {
+        width: 100%;
+        min-height: auto;
+        margin: 0;
+        padding: var(--report-padding-print);
+        box-shadow: none;
+        border: none;
+        border-radius: 0;
+        page-break-after: always;
+      }
+
+      .signatures-wrapper,
+      tr {
+        page-break-inside: avoid;
+      }
+
+      tbody tr:nth-child(even) {
+        background-color: var(--surface-soft-color) !important;
+      }
+    }
+  </style>
+</head>
+<body class="screen-preview">
+  <main class="preview-workspace">
+    <div class="preview-toolbar no-print" aria-label="Handover preview controls">
+      <div class="preview-toolbar__meta">
+        <span class="preview-toolbar__title">Handover V2</span>
+        <span class="preview-toolbar__subtext">A4 preview</span>
+      </div>
+      <div class="preview-toolbar__actions">
+        <button class="toolbar-button toolbar-button--secondary" type="button" onclick="document.querySelector('.a4-wrapper').scrollIntoView({ block: 'start', behavior: 'smooth' })">Preview</button>
+        <button class="toolbar-button toolbar-button--primary" type="button" onclick="window.print()">Print</button>
+      </div>
+    </div>
+
+    <section class="a4-wrapper">
+      <div class="header">
+        <div class="header-left">
+          <? if (logoSrc) { ?>
+            <img class="header-logo" src="<?!= logoSrc ?>" alt="Sociolla" onerror="tryFallbackDriveImage(this, '<?= logoFileId ?>')">
+          <? } else { ?>
+            <div class="brand-text-logo">SOCIOLLA</div>
+          <? } ?>
+        </div>
+        <div class="header-right">
+          <div class="company-name">PT Sociolla Bella Indonesia</div>
+          <div class="company-address">
+            Kavling Blok W01 Griya Idola Industrial Park, Jl. Raya Serang<br>
+            Km.12, Bitung Jaya, Kec. Cikupa, Tangerang,<br>
+            Banten 15710
+          </div>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <div class="report-title"><?= reportTitle ?></div>
+
+      <section class="summary-box" aria-label="Ringkasan Handover">
+        <div class="summary-grid">
+          <div class="summary-column">
+            <div class="summary-row">
+              <span class="summary-label">Brand</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value"><?= valueOrEmpty_(session.brand) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Shipment</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value"><?= valueOrEmpty_(session.shipment) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Inbound Date</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value"><?= formatSignatureDate_(firstFilled_(session.inboundDate, session.date)) ?></span>
+            </div>
+          </div>
+
+          <div class="summary-column">
+            <div class="summary-row">
+              <span class="summary-label">Forwarder</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value"><?= valueOrEmpty_(session.forwarder) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Total Container</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value" data-summary="container"><?= firstFilled_(summary.totalFleet, 0) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Total Pallet</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value" data-summary="pallet"><?= firstFilled_(summary.totalPalet, 0) ?></span>
+            </div>
+          </div>
+
+          <div class="summary-column">
+            <div class="summary-row">
+              <span class="summary-label">Total Koli Aktual</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value" data-summary="actual"><?= firstFilled_(summary.totalActualQty, summary.totalKoli, 0) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Total Koli SJ</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value" data-summary="sj"><?= firstFilled_(summary.totalSjQty, summary.totalSJQty, summary.totalKoliSJ, 0) ?></span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Selisih Koli</span>
+              <span class="summary-colon">:</span>
+              <span class="summary-value" data-summary="variance"><?= firstFilled_(summary.totalVariance, summary.varianceQty, 0) ?></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="table-container" aria-label="Detail Armada">
+        <table>
+          <thead>
+            <tr>
+              <th>No</th>
+              <th>Driver Name</th>
+              <th>Plate No.</th>
+              <th>Vehicle Type</th>
+              <th>Container No.</th>
+              <th>Pallet No.</th>
+              <th>Actual Qty</th>
+              <th>SJ Qty</th>
+              <th>Variance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <? var rowNo = 0; ?>
+            <? fleets.forEach(function(fleet) { ?>
+              <? if (fleet.paletDetails && fleet.paletDetails.length > 0) { ?>
+                <? fleet.paletDetails.forEach(function(palet) { ?>
+                  <?
+                    rowNo++;
+                    var actualQty = firstFilled_(palet.actualQty, palet.koli, "");
+                    var sjQty = firstFilled_(palet.sjQty, palet.qtySj, palet.sjKoli, palet.koliSj, "");
+                    var varianceQty = firstFilled_(palet.variance, palet.varianceQty, "");
+                    if (varianceQty === "" && sjQty !== "") varianceQty = toNumber_(actualQty) - toNumber_(sjQty);
+                  ?>
+                  <tr>
+                    <td><?= rowNo ?></td>
+                    <td><?= valueOrEmpty_(fleet.driver) ?></td>
+                    <td><?= valueOrEmpty_(fleet.plate) ?></td>
+                    <td><?= valueOrEmpty_(fleet.type) ?></td>
+                    <td><?= firstFilled_(fleet.number, fleet.containerNo, fleet.containerNumber) ?></td>
+                    <td><?= firstFilled_(palet.namaPalet, palet.paletName, palet.palletNo, palet.name) ?></td>
+                    <td data-actual="<?= actualQty ?>"><?= actualQty ?></td>
+                    <td data-sj="<?= sjQty ?>"><?= sjQty ?></td>
+                    <td data-variance="<?= varianceQty ?>"><?= varianceQty ?></td>
+                  </tr>
+                <? }); ?>
+              <? } else { ?>
+                <?
+                  rowNo++;
+                  var fleetActualQty = firstFilled_(fleet.actualQty, fleet.qtyKoli, fleet.koli, "");
+                  var fleetSjQty = firstFilled_(fleet.sjQty, fleet.qtySj, fleet.sjKoli, fleet.koliSj, "");
+                  var fleetVarianceQty = firstFilled_(fleet.variance, fleet.varianceQty, "");
+                  if (fleetVarianceQty === "" && fleetSjQty !== "") fleetVarianceQty = toNumber_(fleetActualQty) - toNumber_(fleetSjQty);
+                ?>
+                <tr>
+                  <td><?= rowNo ?></td>
+                  <td><?= valueOrEmpty_(fleet.driver) ?></td>
+                  <td><?= valueOrEmpty_(fleet.plate) ?></td>
+                  <td><?= valueOrEmpty_(fleet.type) ?></td>
+                  <td><?= firstFilled_(fleet.number, fleet.containerNo, fleet.containerNumber) ?></td>
+                  <td>-</td>
+                  <td data-actual="<?= fleetActualQty ?>"><?= fleetActualQty ?></td>
+                  <td data-sj="<?= fleetSjQty ?>"><?= fleetSjQty ?></td>
+                  <td data-variance="<?= fleetVarianceQty ?>"><?= fleetVarianceQty ?></td>
+                </tr>
+              <? } ?>
+            <? }); ?>
+            <? if (!fleets || fleets.length === 0) { ?>
+              <tr>
+                <td colspan="9" class="empty-state">Data armada belum tersedia.</td>
+              </tr>
+            <? } ?>
+          </tbody>
+        </table>
+      </section>
+
+      <div class="signatures-wrapper" aria-label="Tanda Tangan">
+        <div class="signature-slot">
+          <div class="signature-box">
+            <div class="signature-header"><?= config.signatureLeft || "Pic Unloading" ?></div>
+            <div class="signature-body">
+              <div class="signature-space">
+                <? if (picSignatureSrc) { ?>
+                  <img class="signature-image" src="<?!= picSignatureSrc ?>" alt="Tanda Tangan <?= valueOrEmpty_(session.pic) ?>" onerror="tryFallbackDriveImage(this, '<?= picSignatureFileId ?>')">
+                <? } else { ?>
+                  <div style="height: 70px; width: 1px;">&nbsp;</div>
+                <? } ?>
+              </div>
+              <div class="meta-row meta-row-name">
+                <div class="meta-label">Name</div>
+                <div class="meta-value"><?= valueOrEmpty_(session.pic) ?></div>
+              </div>
+              <div class="meta-row meta-row-date">
+                <div class="meta-label">Date</div>
+                <div class="meta-value"><?= formatSignatureDate_(session.date) ?></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="signature-slot">
+          <div class="signature-box">
+            <div class="signature-header"><?= config.signatureRight || "Loss Prevention" ?></div>
+            <div class="signature-body">
+              <div class="signature-space">
+                <? if (lpSignatureSrc) { ?>
+                  <img class="signature-image" src="<?!= lpSignatureSrc ?>" alt="Tanda Tangan <?= valueOrEmpty_(session.lossPreventionName) ?>" onerror="tryFallbackDriveImage(this, '<?= lpSignatureFileId ?>')">
+                <? } else { ?>
+                  <div style="height: 70px; width: 1px;">&nbsp;</div>
+                <? } ?>
+              </div>
+              <div class="meta-row meta-row-name">
+                <div class="meta-label">Name</div>
+                <div class="meta-value"><?= session.lossPreventionName || "" ?></div>
+              </div>
+              <div class="meta-row meta-row-date">
+                <div class="meta-label">Date</div>
+                <div class="meta-value"><?= lpSignatureDate ? formatSignatureDate_(lpSignatureDate) : "" ?></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    function parseQty(value) {
+      var normalized = String(value || '').replace(/[^0-9.-]/g, '');
+      var parsed = Number(normalized);
+      return isNaN(parsed) ? 0 : parsed;
+    }
+
+    function setSummary(name, value) {
+      var target = document.querySelector('[data-summary="' + name + '"]');
+      if (target) target.textContent = String(value);
+    }
+
+    function calculateTotals() {
+      var rows = Array.prototype.slice.call(document.querySelectorAll('tbody tr'));
+      var containers = {};
+      var pallets = {};
+      var actual = 0;
+      var sj = 0;
+
+      rows.forEach(function(row) {
+        var cells = row.querySelectorAll('td');
+        if (cells.length < 9) return;
+        var containerNo = cells[4].textContent.trim();
+        var palletNo = cells[5].textContent.trim();
+        if (containerNo && containerNo !== '-') containers[containerNo] = true;
+        if (palletNo && palletNo !== '-') pallets[containerNo + '|' + palletNo] = true;
+        actual += parseQty(cells[6].textContent);
+        sj += parseQty(cells[7].textContent);
+      });
+
+      setSummary('container', Object.keys(containers).length);
+      setSummary('pallet', Object.keys(pallets).length);
+      setSummary('actual', actual);
+      setSummary('sj', sj);
+      setSummary('variance', actual - sj);
+    }
+
+    function tryFallbackDriveImage(img, id) {
+      if (!id) {
+        img.style.display = 'none';
+        return;
+      }
+      if (!img.dataset.retried) {
+        img.dataset.retried = 'true';
+        img.src = 'https://drive.google.com/uc?export=view&id=' + id;
+        return;
+      }
+      img.style.display = 'none';
+    }
+
+    document.addEventListener('DOMContentLoaded', calculateTotals);
+  </script>
+</body>
+</html>

@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Demo UI Armada</title>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f1f5f9;
+      padding: 20px;
+      display: flex;
+      justify-content: center;
+    }
+    .fleet-card {
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+      padding: 20px;
+      width: 100%;
+      max-width: 500px;
+      border: 1px dashed #cbd5e1;
+    }
+    .detail-header {
+      margin-bottom: 20px;
+    }
+    .detail-header h3 {
+      margin: 0 0 5px 0;
+      color: #0f172a;
+      font-size: 18px;
+    }
+    .detail-header small {
+      color: #64748b;
+      font-size: 14px;
+    }
+    .fleet-work-detail {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 15px;
+      font-size: 14px;
+    }
+    .fleet-work-badge {
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .fleet-work-badge.ready {
+      background: #e2e8f0;
+      color: #475569;
+    }
+    .fleet-work-badge.in-progress {
+      background: #dcfce7;
+      color: #166534;
+    }
+    .fleet-work-badge.upload-only {
+      background: #dbeafe;
+      color: #1e40af;
+    }
+    .fleet-work-badge.done {
+      background: #f1f5f9;
+      color: #64748b;
+    }
+    .fleet-work-timer {
+      font-weight: 500;
+      color: #334155;
+    }
+    
+    .detail-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid #e2e8f0;
+    }
+    button {
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+      flex: 1;
+    }
+    .btn-start { background: #3b82f6; color: white; }
+    .btn-start:hover { background: #2563eb; }
+    
+    .btn-pause { background: #f59e0b; color: white; }
+    .btn-pause:hover { background: #d97706; }
+    
+    .btn-resume { background: #10b981; color: white; }
+    .btn-resume:hover { background: #059669; }
+    
+    .btn-finish { background: #ef4444; color: white; }
+    .btn-finish:hover { background: #dc2626; }
+    
+    .btn-reopen { background: #64748b; color: white; }
+    .btn-reopen:hover { background: #475569; }
+    
+    .control-panel {
+      margin-top: 40px;
+      padding: 15px;
+      background: #e2e8f0;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .info-text {
+      font-size: 13px;
+      color: #64748b;
+      margin-top: 10px;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+
+  <div>
+    <div class="fleet-card">
+      <div class="detail-header">
+        <h3>Blind Van #1 &mdash; Ahmad</h3>
+        <small>B 1234 CD</small>
+        <div class="fleet-work-detail">
+          <span id="badge" class="fleet-work-badge ready">Belum mulai</span>
+          <span id="timer" class="fleet-work-timer">--:--</span>
+        </div>
+      </div>
+      <div class="detail-actions" id="actions-container">
+        <!-- Buttons injected by JS -->
+      </div>
+      <div id="info" class="info-text">Silakan klik "Mulai Armada" saat truk mulai dibongkar.</div>
+    </div>
+    
+    <div class="control-panel">
+      <strong>Panel Simulasi Timer (Dipercepat)</strong><br><br>
+      Status Saat Ini: <span id="debug-status" style="font-weight:bold;">READY</span><br>
+      Total Akumulasi: <span id="debug-acc">0</span> detik
+    </div>
+  </div>
+
+  <script>
+    // State Management
+    let state = 'READY'; // READY, IN_PROGRESS, UPLOAD_ONLY, DONE
+    let accSeconds = 0;
+    let activeStart = null;
+    let timerInterval = null;
+
+    // UI Elements
+    const badge = document.getElementById('badge');
+    const timerEl = document.getElementById('timer');
+    const actionsCont = document.getElementById('actions-container');
+    const info = document.getElementById('info');
+    const dbgStatus = document.getElementById('debug-status');
+    const dbgAcc = document.getElementById('debug-acc');
+
+    function formatTime(seconds) {
+      if (seconds < 0) seconds = 0;
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      
+      let res = '';
+      if (h > 0) res += h + 'j ';
+      res += m + 'm ' + (s < 10 ? '0' : '') + s + 'd';
+      return res;
+    }
+
+    function updateTimerUI() {
+      if (state === 'READY') {
+        timerEl.textContent = '--:--';
+      } else if (state === 'IN_PROGRESS') {
+        const currentRun = Math.floor((Date.now() - activeStart) / 100); // Dipercepat 10x untuk demo
+        timerEl.textContent = '⏱ ' + formatTime(accSeconds + currentRun);
+      } else {
+        // UPLOAD_ONLY or DONE
+        timerEl.textContent = formatTime(accSeconds);
+      }
+    }
+
+    function renderUI() {
+      dbgStatus.textContent = state;
+      dbgAcc.textContent = accSeconds;
+
+      if (state === 'READY') {
+        badge.className = 'fleet-work-badge ready';
+        badge.textContent = 'Belum mulai';
+        actionsCont.innerHTML = '<button class="btn-start" onclick="actionStart()">Mulai Armada</button>';
+        info.innerHTML = 'Silakan klik "Mulai Armada" saat truk mulai dibongkar.';
+      } 
+      else if (state === 'IN_PROGRESS') {
+        badge.className = 'fleet-work-badge in-progress';
+        badge.textContent = 'Berjalan';
+        actionsCont.innerHTML = `
+          <button class="btn-pause" onclick="actionPause()">Selesai Fisik</button>
+          <button class="btn-finish" onclick="actionFinish()">Finish Armada</button>
+        `;
+        info.innerHTML = 'Gunakan <strong>Selesai Fisik</strong> jika bongkar barang sudah selesai tapi Anda masih butuh waktu upload foto agar timer berhenti.';
+      }
+      else if (state === 'UPLOAD_ONLY') {
+        badge.className = 'fleet-work-badge upload-only';
+        badge.textContent = 'Selesai Fisik (Bisa Upload)';
+        actionsCont.innerHTML = `
+          <button class="btn-resume" onclick="actionResume()">Lanjut Bongkar</button>
+          <button class="btn-finish" onclick="actionFinish()">Finish Armada</button>
+        `;
+        info.innerHTML = 'Timer terkunci. Anda bebas mengunggah foto. Jika harus bongkar barang lagi, klik <strong>Lanjut Bongkar</strong>.';
+      }
+      else if (state === 'DONE') {
+        badge.className = 'fleet-work-badge done';
+        badge.textContent = 'Selesai';
+        actionsCont.innerHTML = '<button class="btn-reopen" onclick="actionReopen()">Batal Finish</button>';
+        info.innerHTML = 'Armada telah terkunci total (Tidak bisa upload). Klik Batal Finish jika ada kesalahan.';
+      }
+      
+      updateTimerUI();
+    }
+
+    function actionStart() {
+      state = 'IN_PROGRESS';
+      activeStart = Date.now();
+      timerInterval = setInterval(updateTimerUI, 100); // update cepat untuk demo
+      renderUI();
+    }
+
+    function actionPause() {
+      // Simpan durasi saat ini
+      accSeconds += Math.floor((Date.now() - activeStart) / 100);
+      state = 'UPLOAD_ONLY';
+      clearInterval(timerInterval);
+      renderUI();
+    }
+
+    function actionResume() {
+      state = 'IN_PROGRESS';
+      activeStart = Date.now();
+      timerInterval = setInterval(updateTimerUI, 100);
+      renderUI();
+    }
+
+    function actionFinish() {
+      if (state === 'IN_PROGRESS') {
+        accSeconds += Math.floor((Date.now() - activeStart) / 100);
+        clearInterval(timerInterval);
+      }
+      state = 'DONE';
+      renderUI();
+    }
+
+    function actionReopen() {
+      state = 'UPLOAD_ONLY';
+      // Biasanya Batal Finish akan kembali ke UPLOAD_ONLY atau IN_PROGRESS
+      // Kita asumsikan kembali ke UPLOAD_ONLY agar timer tidak otomatis bocor
+      renderUI();
+    }
+
+    // Init
+    renderUI();
+
+  </script>
+</body>
+</html>

@@ -1,0 +1,3527 @@
+<script>
+// =========================================================================
+// UploadModule.html — Local-First Upload System
+// V6 OVERHAUL: IndexedDB + Batch + Limited Retry + Pending Log Queue
+// =========================================================================
+
+// =========================================================================
+// 1. INDEXEDDB — Persistent Local Storage for Upload Queue
+// =========================================================================
+var UPLOAD_DB_NAME = 'InLensUploadDB';
+var UPLOAD_DB_VERSION = 1;
+var STORE_QUEUE = 'localUploadQueue';
+var STORE_BATCH = 'uploadBatch';
+var STORE_PENDING_LOG = 'pendingLogQueue';
+var _uploadDB = null;
+var _uploadModuleInitialized = false;
+var _activeUploadJob = null;
+var _activeBatchProgress = null;
+var _uploadPausedOffline = !navigator.onLine;
+var _offlineToastShown = false;
+var _onlineToastShown = false;
+var _uploadOnlineWaiters = [];
+var DRIVE_SLOW_NOTICE_MS = 12000;
+var DRIVE_UPLOAD_TIMEOUT_MS = 60000;
+var FINAL_SYNC_MAX_ATTEMPTS = 3;
+var FINAL_SYNC_RETRY_DELAY_MS = 900;
+
+function createUploadJob(totalCount, categories) {
+  return {
+    jobId: 'job_' + Date.now() + '_' + Math.random().toString(36).substr(2, 7),
+    status: 'INIT',
+    totalCount: totalCount || 0,
+    categories: categories || [],
+    successCount: 0,
+    failedCount: 0,
+    pendingLogCount: 0,
+    syncPendingCount: 0,
+    publicWarning: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+}
+
+function setUploadJobStatus(job, status, updates) {
+  if (!job) return null;
+  job.status = status;
+  job.updatedAt = Date.now();
+  if (updates) {
+    for (var key in updates) {
+      if (updates.hasOwnProperty(key)) job[key] = updates[key];
+    }
+  }
+  _activeUploadJob = job;
+  return job;
+}
+
+function getUploadCategoryLabel(category) {
+  if (category === 'palet') return CLIENT_CONFIG.PALET_SUBFOLDER || 'Palet';
+  if (category === 'suratjalan') return CLIENT_CONFIG.SURAT_SUBFOLDER || 'Surat Jalan';
+  return CLIENT_CONFIG.DOC_SUBFOLDER || 'Dokumen';
+}
+
+function setActiveBatchProgress(batch, phase, sent, total) {
+  if (!batch) {
+    _activeBatchProgress = null;
+    return;
+  }
+  _activeBatchProgress = {
+    jobId: batch.jobId || '',
+    batchId: batch.batchId,
+    label: batch.label || ('Batch ' + getUploadCategoryLabel(batch.category)),
+    phase: phase || 'Menunggu',
+    sent: sent || 0,
+    total: total || batch.totalItems || 0
+  };
+}
+
+function getActiveUploadJobId() {
+  return _activeUploadJob && _activeUploadJob.status !== 'DONE' ? _activeUploadJob.jobId : '';
+}
+
+function isSameUploadJob(value, jobId) {
+  return !!jobId && !!value && (value.jobId === jobId || (value.meta && value.meta.jobId === jobId));
+}
+
+function filterUploadJobItems(items, jobId) {
+  if (!jobId) return [];
+  return (items || []).filter(function(item) { return isSameUploadJob(item, jobId); });
+}
+
+function isUnfinishedLocalUpload(item) {
+  if (!item || item.status === 'DONE' || item.status === 'FINAL_SYNCED') return false;
+  return true;
+}
+
+function completeUploadJobIfClear_(jobId, items, pendingLogs) {
+  if (!jobId || !_activeUploadJob || _activeUploadJob.jobId !== jobId) return false;
+  if (String(_activeUploadJob.status || '') === 'INIT') return false;
+  var hasUnfinished = (items || []).some(isUnfinishedLocalUpload);
+  if (hasUnfinished || (pendingLogs || []).length > 0) return false;
+  setUploadJobStatus(_activeUploadJob, 'DONE', {
+    successCount: _activeUploadJob.totalCount || 0,
+    failedCount: 0,
+    pendingLogCount: 0
+  });
+  _activeBatchProgress = null;
+  return true;
+}
+
+function assertGasSuccess(res, fallbackMessage) {
+  if (!res || res.success === false) {
+    throw new Error((res && res.message) || fallbackMessage || 'Server gagal memproses data');
+  }
+  return res;
+}
+
+function getUploadSessionId(item) {
+  return String((item && (item.sessionId || (item.meta && item.meta.sessionId))) || '').trim();
+}
+
+function uploadSleep_(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+function showDrivePublicWarning_(warning) {
+  warning = String(warning || '').trim();
+  if (!warning) return;
+  try {
+    Toast.fire({
+      icon: 'warning',
+      title: 'Foto tersimpan, akses preview perlu dicek',
+      text: warning.length > 120 ? warning.substring(0, 120) + '...' : warning
+    });
+  } catch (e) {}
+}
+
+function createLocalPlaceholder(meta, fileName) {
+  meta = meta || {};
+  var localId = _generateLocalId();
+  var item = {
+    localId: localId,
+    batchId: '',
+    category: meta.uploadType || 'dokumen',
+    blob: null,
+    previewUrl: '',
+    fileName: fileName || meta.fileName || '',
+    sessionId: meta.sessionId || '',
+    containerId: meta.containerId || '',
+    jobId: meta.jobId || '',
+    uploadType: meta.uploadType || 'dokumen',
+    meta: meta,
+    fileId: null,
+    status: 'COMPRESSING',
+    attempts: 0,
+    logAttempts: 0,
+    errorMessage: '',
+    errorType: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  return _idbPut(STORE_QUEUE, item).then(function() { return item; });
+}
+
+function getVisiblePhotoIdMapFromState_() {
+  var map = {};
+  (state.containers || []).forEach(function(container) {
+    (container.photos || []).forEach(function(photo) {
+      var id = String((photo && photo.id) || '').trim();
+      if (id) map[id] = true;
+    });
+  });
+  return map;
+}
+
+function getMissingLoggedFileIds_(logItems) {
+  var visible = getVisiblePhotoIdMapFromState_();
+  var missing = [];
+  (logItems || []).forEach(function(item) {
+    var fileId = String((item && item.fileId) || '').trim();
+    if (fileId && !visible[fileId]) missing.push(fileId);
+  });
+  return missing;
+}
+
+function applyUploadSyncResponse_(res, traceId) {
+  if (!res || !res.success || !res.data) return false;
+  var data = res.data || {};
+  try {
+    lastSyncHash = buildSyncHash(data.containers, data.sjQty, data.users, data.session);
+  } catch (hashErr) {
+    lastSyncHash = '';
+  }
+  state.containers = data.containers || [];
+  state._users = data.users || [];
+  state.sjQtyStatus = data.sjQty || null;
+  if (data.session) {
+    state.activeSession = {
+      brand: data.session.brand,
+      shipment: data.session.shipment,
+      date: data.session.date,
+      pic: data.session.pic,
+      createdBy: data.session.createdBy,
+      forwarder: data.session.forwarder || '',
+      lossPreventionName: data.session.lossPreventionName || '',
+      lossPreventionDate: data.session.lossPreventionDate || '',
+      lossPreventionFilledBy: data.session.lossPreventionFilledBy || '',
+      lossPreventionSignatureMode: data.session.lossPreventionSignatureMode || '',
+      lossPreventionSignatureFileId: data.session.lossPreventionSignatureFileId || '',
+      lossPreventionSignatureFileUrl: data.session.lossPreventionSignatureFileUrl || '',
+      lossPreventionSignatureSignedAt: data.session.lossPreventionSignatureSignedAt || ''
+    };
+  }
+  var me = (data.users || []).find(function(u) {
+    return String(u.name || '').toLowerCase() === String(state.fullName || state.username || '').toLowerCase();
+  });
+  if (me) state.myStatus = me.status;
+  save();
+  var page = document.getElementById('page-session');
+  if (page && page.classList.contains('active')) {
+    renderSplitList(data);
+    if (state.activeContainerId) renderSplitDetail();
+  }
+  if (typeof crudTraceAfterRender === 'function') {
+    crudTraceAfterRender('uploadFinalSync', traceId || 'upload-final-sync', 'ui_render_done');
+  }
+  return true;
+}
+
+async function forceUploadCloudSync_(sessionId, traceId) {
+  sessionId = String(sessionId || state.activeSessionId || '').trim();
+  if (!sessionId) return { success: false, message: 'Session ID kosong.' };
+  var res = await gasRun('syncSessionData', [sessionId, true, traceId], 30000);
+  if (applyUploadSyncResponse_(res, traceId)) return res;
+  return res || { success: false, message: 'Sync tidak mengembalikan data.' };
+}
+
+async function cleanupFinalSyncedLocalItems_(localIds) {
+  for (var i = 0; i < (localIds || []).length; i++) {
+    var localId = localIds[i];
+    var item = await _idbGet(STORE_QUEUE, localId);
+    if (item && item.previewUrl) {
+      try { URL.revokeObjectURL(item.previewUrl); } catch (e) {}
+    }
+    await removeFromLocal(localId);
+  }
+}
+
+async function finalizeLoggedItemsAfterSync_(localIds, logItems, job, traceId) {
+  localIds = (localIds || []).filter(Boolean);
+  logItems = (logItems || []).filter(function(item) { return item && item.fileId; });
+  if (localIds.length === 0 || logItems.length === 0) return { success: true, finalizedCount: 0, pendingCount: 0 };
+
+  for (var i = 0; i < localIds.length; i++) {
+    await updateLocalItem(localIds[i], {
+      status: 'SYNC_PENDING',
+      errorMessage: 'Data tersimpan. Menunggu tampilan aplikasi tersinkron.'
+    });
+  }
+  setUploadJobStatus(job || _activeUploadJob, 'SYNC_PENDING', { syncPendingCount: localIds.length });
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+
+  var sessionId = (job && job.sessionId) || (logItems[0] && logItems[0].sessionId) || state.activeSessionId;
+  var missing = getMissingLoggedFileIds_(logItems);
+  for (var attempt = 0; attempt < FINAL_SYNC_MAX_ATTEMPTS && missing.length > 0; attempt++) {
+    try {
+      await forceUploadCloudSync_(sessionId, (traceId || 'upload-final-sync') + '-attempt-' + (attempt + 1));
+    } catch (syncErr) {
+      crudTrace('uploadFinalSync', traceId || 'upload-final-sync', 'sync_attempt_failed', {
+        attempt: attempt + 1,
+        message: syncErr && syncErr.message ? syncErr.message : String(syncErr)
+      });
+    }
+    missing = getMissingLoggedFileIds_(logItems);
+    if (missing.length === 0) break;
+    await uploadSleep_(FINAL_SYNC_RETRY_DELAY_MS);
+  }
+
+  if (missing.length === 0) {
+    await cleanupFinalSyncedLocalItems_(localIds);
+    return { success: true, finalizedCount: localIds.length, pendingCount: 0 };
+  }
+
+  for (var p = 0; p < localIds.length; p++) {
+    await updateLocalItem(localIds[p], {
+      status: 'SYNC_PENDING',
+      errorMessage: 'Data tersimpan, tetapi tampilan belum berhasil sinkron. Tekan Sinkronkan ulang.'
+    });
+  }
+  setUploadJobStatus(job || _activeUploadJob, 'SYNC_PENDING', { syncPendingCount: localIds.length });
+  return { success: false, finalizedCount: 0, pendingCount: localIds.length, missingFileIds: missing };
+}
+
+async function finalizeSyncPendingItems(jobId, isManual) {
+  var items = await getLocalQueue();
+  if (jobId) items = items.filter(function(item) { return item.jobId === jobId; });
+  items = items.filter(function(item) { return item.status === 'SYNC_PENDING' && item.fileId; });
+  if (items.length === 0) {
+    if (isManual !== false) Toast.fire({ icon: 'info', title: 'Tidak ada sinkronisasi pending' });
+    return;
+  }
+  var logItems = items.map(function(item) {
+    return {
+      localId: item.localId,
+      jobId: item.jobId || '',
+      sessionId: item.sessionId || (item.meta && item.meta.sessionId) || '',
+      fileId: item.fileId,
+      containerId: item.containerId,
+      type: item.uploadType,
+      fileName: item.fileName,
+      paletName: (item.meta && item.meta.paletName) || '',
+      paletKoli: (item.meta && item.meta.paletKoli) || ''
+    };
+  });
+  var res = await finalizeLoggedItemsAfterSync_(
+    items.map(function(item) { return item.localId; }),
+    logItems,
+    _activeUploadJob,
+    'manual-final-sync-' + Date.now()
+  );
+  if (res.success) {
+    lastSyncHash = '';
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+    Toast.fire({ icon: 'success', title: items.length + ' foto sudah tersinkron final' });
+  } else if (isManual !== false) {
+    Toast.fire({ icon: 'warning', title: res.pendingCount + ' foto masih menunggu sinkronisasi' });
+  }
+}
+
+function getUploadBlockingSummary(sessionId) {
+  sessionId = String(sessionId || '').trim();
+  return openUploadDB().then(function() {
+    return getLocalQueue().then(function(items) {
+      return _idbGetAll(STORE_PENDING_LOG).then(function(pendingLogs) {
+        var summary = {
+          blocking: false,
+          uploadPending: 0,
+          logPending: 0,
+          syncPending: 0,
+          failedUpload: 0,
+          total: 0
+        };
+        var pendingLogIds = {};
+        (pendingLogs || []).forEach(function(p) {
+          if (sessionId && getUploadSessionId(p) !== sessionId) return;
+          pendingLogIds[p.localId] = true;
+        });
+        (items || []).forEach(function(item) {
+          if (!isUnfinishedLocalUpload(item)) return;
+          if (sessionId && getUploadSessionId(item) !== sessionId) return;
+          if (pendingLogIds[item.localId]) return;
+          summary.total++;
+          var status = String(item.status || '');
+          if (status === 'SYNC_PENDING') {
+            summary.logPending++;
+            summary.syncPending++;
+          } else if (status === 'FAILED_LOG' || status === 'FAILED_LOG_MANUAL' || status === 'LOG_PENDING' || status === 'UPLOAD_SUCCESS' || item.failureStage === 'log') {
+            summary.logPending++;
+          } else if (isManualActionStatus(status) || status === 'FAILED_UPLOAD' || status === 'WAITING_MANUAL_RETRY') {
+            summary.failedUpload++;
+          } else {
+            summary.uploadPending++;
+          }
+        });
+        (pendingLogs || []).forEach(function(p) {
+          if (sessionId && getUploadSessionId(p) !== sessionId) return;
+          summary.total++;
+          summary.logPending++;
+        });
+        summary.blocking = summary.uploadPending > 0 || summary.logPending > 0 || summary.failedUpload > 0;
+        return summary;
+      });
+    });
+  });
+}
+
+function setOfflineBannerMessage(message) {
+  var banner = document.getElementById('offline-banner');
+  if (!banner) return;
+  var span = banner.querySelector('span');
+  if (span) span.textContent = message;
+}
+
+function waitForOnline() {
+  if (navigator.onLine) return Promise.resolve();
+  return new Promise(function(resolve) {
+    _uploadOnlineWaiters.push(resolve);
+  });
+}
+
+function handleUploadOffline() {
+  _uploadPausedOffline = true;
+  setOfflineBannerMessage('Tidak ada koneksi internet. Upload dijeda.');
+  var banner = document.getElementById('offline-banner');
+  if (banner) banner.classList.add('show');
+  if (!_offlineToastShown) {
+    _offlineToastShown = true;
+    _onlineToastShown = false;
+    Toast.fire({ icon:'warning', title:'Koneksi terputus, upload dijeda' });
+  }
+  renderUploadTrackerV2();
+}
+
+function handleUploadOnline() {
+  _uploadPausedOffline = false;
+  setOfflineBannerMessage('Tidak ada koneksi internet');
+  var banner = document.getElementById('offline-banner');
+  if (banner) banner.classList.remove('show');
+  if (!_onlineToastShown) {
+    _onlineToastShown = true;
+    _offlineToastShown = false;
+    Toast.fire({ icon:'success', title:'Koneksi kembali, upload dilanjutkan' });
+  }
+  var waiters = _uploadOnlineWaiters.splice(0);
+  waiters.forEach(function(resolve) { resolve(); });
+  renderUploadTrackerV2();
+}
+
+async function ensureOnlineBeforeUpload(localId) {
+  if (navigator.onLine) return;
+  await updateLocalItem(localId, {
+    status: 'OFFLINE_PAUSED',
+    errorMessage: 'Koneksi terputus. Upload dijeda.'
+  });
+  handleUploadOffline();
+  await waitForOnline();
+  await updateLocalItem(localId, {
+    status: 'ONLINE_RESUMING',
+    errorMessage: 'Koneksi kembali. Melanjutkan upload...'
+  });
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+function openUploadDB() {
+  return new Promise(function(resolve, reject) {
+    if (_uploadDB) return resolve(_uploadDB);
+    var req = indexedDB.open(UPLOAD_DB_NAME, UPLOAD_DB_VERSION);
+    req.onupgradeneeded = function(e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_QUEUE)) {
+        var qs = db.createObjectStore(STORE_QUEUE, { keyPath: 'localId' });
+        qs.createIndex('status', 'status', { unique: false });
+        qs.createIndex('batchId', 'batchId', { unique: false });
+        qs.createIndex('category', 'category', { unique: false });
+        qs.createIndex('sessionId', 'sessionId', { unique: false });
+        qs.createIndex('containerId', 'containerId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_BATCH)) {
+        db.createObjectStore(STORE_BATCH, { keyPath: 'batchId' });
+      }
+      if (!db.objectStoreNames.contains(STORE_PENDING_LOG)) {
+        var ps = db.createObjectStore(STORE_PENDING_LOG, { keyPath: 'localId' });
+        ps.createIndex('status', 'status', { unique: false });
+        ps.createIndex('batchId', 'batchId', { unique: false });
+      }
+    };
+    req.onsuccess = function(e) {
+      _uploadDB = e.target.result;
+      resolve(_uploadDB);
+    };
+    req.onerror = function(e) {
+      console.error('IndexedDB open failed:', e);
+      reject(new Error('Gagal membuka penyimpanan lokal'));
+    };
+  });
+}
+
+function _idbPut(storeName, data) {
+  return openUploadDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).put(data);
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function _idbGet(storeName, key) {
+  return openUploadDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(storeName, 'readonly');
+      var req = tx.objectStore(storeName).get(key);
+      req.onsuccess = function() { resolve(req.result); };
+      req.onerror = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function _idbDelete(storeName, key) {
+  return openUploadDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).delete(key);
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function _idbGetAll(storeName, indexName, indexValue) {
+  return openUploadDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(storeName, 'readonly');
+      var store = tx.objectStore(storeName);
+      var req;
+      if (indexName && indexValue !== undefined) {
+        req = store.index(indexName).getAll(indexValue);
+      } else {
+        req = store.getAll();
+      }
+      req.onsuccess = function() { resolve(req.result || []); };
+      req.onerror = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function _idbClearStore(storeName) {
+  return openUploadDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(storeName, 'readwrite');
+      tx.objectStore(storeName).clear();
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function _generateLocalId() {
+  return 'loc_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+// =========================================================================
+// 2. LOCAL QUEUE OPERATIONS
+// =========================================================================
+
+function saveToLocal(blob, meta) {
+  var localId = _generateLocalId();
+  var previewUrl = URL.createObjectURL(blob);
+  var item = {
+    localId: localId,
+    batchId: '',
+    category: meta.uploadType || 'dokumen',
+    blob: blob,
+    previewUrl: previewUrl,
+    fileName: meta.fileName || '',
+    sessionId: meta.sessionId || '',
+    containerId: meta.containerId || '',
+    jobId: meta.jobId || '',
+    uploadType: meta.uploadType || 'dokumen',
+    meta: meta,
+    fileId: null,
+    status: 'LOCAL_SAVED',
+    attempts: 0,
+    logAttempts: 0,
+    errorMessage: '',
+    errorType: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  return _idbPut(STORE_QUEUE, item).then(function() {
+    return item;
+  });
+}
+
+function updateLocalItem(localId, updates) {
+  return _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) return null;
+    for (var key in updates) {
+      if (updates.hasOwnProperty(key)) item[key] = updates[key];
+    }
+    item.updatedAt = Date.now();
+    return _idbPut(STORE_QUEUE, item).then(function() { return item; });
+  });
+}
+
+function removeFromLocal(localId) {
+  return _idbDelete(STORE_QUEUE, localId);
+}
+
+function getLocalQueue(filter) {
+  if (filter && filter.jobId) {
+    return _idbGetAll(STORE_QUEUE).then(function(items) {
+      return items.filter(function(i) { return i.jobId === filter.jobId; });
+    });
+  }
+  if (filter && filter.status) {
+    return _idbGetAll(STORE_QUEUE, 'status', filter.status);
+  }
+  if (filter && filter.containerId) {
+    return _idbGetAll(STORE_QUEUE, 'containerId', filter.containerId);
+  }
+  if (filter && filter.batchId) {
+    return _idbGetAll(STORE_QUEUE, 'batchId', filter.batchId);
+  }
+  return _idbGetAll(STORE_QUEUE);
+}
+
+function getLocalQueueForContainer(containerId, category) {
+  return _idbGetAll(STORE_QUEUE, 'containerId', containerId).then(function(items) {
+    if (!category) return items;
+    return items.filter(function(i) { return i.category === category; });
+  });
+}
+
+// =========================================================================
+// 3. BATCH MANAGER
+// =========================================================================
+var BATCH_MAX_SIZE = 10;
+var UPLOAD_PARALLEL = 4;
+
+function createBatches(items, category, jobId) {
+  var batches = [];
+  var grouped = {};
+  var order = ['dokumen', 'palet', 'suratjalan'];
+
+  items.forEach(function(item) {
+    var cat = item.category || item.uploadType || category || 'dokumen';
+    if (!grouped[cat]) grouped[cat] = [];
+    grouped[cat].push(item);
+    if (order.indexOf(cat) < 0) order.push(cat);
+  });
+
+  order.forEach(function(cat) {
+    var group = grouped[cat] || [];
+    if (!group.length) return;
+    var prefix = cat === 'palet' ? 'PAL' : cat === 'suratjalan' ? 'SJ' : 'DOK';
+    var totalCategoryBatches = Math.ceil(group.length / BATCH_MAX_SIZE);
+
+    for (var i = 0; i < group.length; i += BATCH_MAX_SIZE) {
+      var batchNum = Math.floor(i / BATCH_MAX_SIZE) + 1;
+      var batchId = prefix + '-BATCH-' + String(batchNum).padStart(3, '0') + '-' + Date.now();
+      var chunk = group.slice(i, i + BATCH_MAX_SIZE);
+      var label = 'Batch ' + getUploadCategoryLabel(cat) + ' ' + batchNum + '/' + totalCategoryBatches;
+      batches.push({
+        batchId: batchId,
+        jobId: jobId || '',
+        category: cat,
+        label: label,
+        categoryBatchNo: batchNum,
+        categoryBatchTotal: totalCategoryBatches,
+        sessionId: chunk[0] ? chunk[0].sessionId : '',
+        containerId: chunk[0] ? chunk[0].containerId : '',
+        totalItems: chunk.length,
+        uploadedCount: 0,
+        loggedCount: 0,
+        syncPendingCount: 0,
+        failedCount: 0,
+        status: 'PENDING',
+        phase: 'Menunggu',
+        createdAt: Date.now(),
+        completedAt: null,
+        itemIds: chunk.map(function(c) { return c.localId; })
+      });
+      for (var j = 0; j < chunk.length; j++) {
+        chunk[j].batchId = batchId;
+        chunk[j].jobId = jobId || chunk[j].jobId || '';
+        chunk[j].status = 'WAITING_BATCH';
+      }
+    }
+  });
+  return batches;
+}
+
+// =========================================================================
+// 4. ERROR CLASSIFICATION
+// =========================================================================
+var RETRYABLE_PATTERNS = [
+  'failed to fetch', 'networkerror', 'net::err_', 'timeout',
+  'server tidak merespons', 'ratelimitexceeded', 'userratelimitexceeded',
+  'backenderror', 'internalerror', 'load failed',
+  'the internet connection appears to be offline'
+];
+var RETRYABLE_STATUSES = [408, 429, 500, 502, 503, 504];
+
+function isRetryableError(error) {
+  var msg = String(error && error.message || error || '').toLowerCase();
+  var status = error && error.status || 0;
+  if (!navigator.onLine) return true;
+  for (var i = 0; i < RETRYABLE_STATUSES.length; i++) {
+    if (status === RETRYABLE_STATUSES[i]) return true;
+  }
+  for (var j = 0; j < RETRYABLE_PATTERNS.length; j++) {
+    if (msg.indexOf(RETRYABLE_PATTERNS[j]) >= 0) return true;
+  }
+  return false;
+}
+
+function classifyDriveError(error) {
+  var status = error && error.status || 0;
+  var body = String(error && error.body || '').toLowerCase();
+  var msg = String(error && error.message || error || '');
+
+  if (status === 400) return { type: 'PERMANENT', message: 'Request tidak valid: ' + msg };
+  if (status === 403 && body.indexOf('storagequotaexceeded') >= 0) return { type: 'PERMANENT', message: 'Storage Google Drive penuh' };
+  if (status === 403 && body.indexOf('ratelimitexceeded') < 0) return { type: 'PERMANENT', message: 'Tidak punya akses ke folder Drive' };
+  if (status === 404) return { type: 'PERMANENT', message: 'Folder Drive tidak ditemukan' };
+  if (status === 401) return { type: 'RETRYABLE', message: 'Token expired, mencoba refresh...' };
+  if (status === 429) return { type: 'RETRYABLE', message: 'Terlalu banyak request, menunggu...' };
+  if (status >= 500) return { type: 'RETRYABLE', message: 'Server Drive error' };
+  if (!navigator.onLine) return { type: 'RETRYABLE', message: 'Tidak ada koneksi internet' };
+  if (msg.toLowerCase().indexOf('abort') >= 0) return { type: 'RETRYABLE', message: 'Jaringan lambat, masih mencoba...' };
+  return { type: 'RETRYABLE', message: msg || 'Upload gagal' };
+}
+
+function isManualActionStatus(status) {
+  return status === 'WAITING_MANUAL_RETRY'
+    || status === 'FAILED_UPLOAD'
+    || status === 'FAILED_UPLOAD_MANUAL'
+    || status === 'FAILED_LOG_MANUAL'
+    || status === 'NEED_USER_ACTION';
+}
+
+function getUploadStatusMessage(item) {
+  var status = item && item.status;
+  if (status === 'PREPARING') return 'Menyiapkan foto...';
+  if (status === 'COMPRESSING') return 'Mengompres foto...';
+  if (status === 'UPLOADING') return 'Mengirim foto...';
+  if (status === 'SLOW_NETWORK') return 'Jaringan lambat, masih mencoba...';
+  if (status === 'OFFLINE_PAUSED') return 'Koneksi terputus. Upload dijeda.';
+  if (status === 'ONLINE_RESUMING') return 'Koneksi kembali. Melanjutkan upload...';
+  if (status === 'RETRY_1_WAITING') return 'Mencoba ulang 1/2 dalam 2 detik...';
+  if (status === 'RETRY_2_WAITING') return 'Mencoba ulang 2/2 dalam 4 detik...';
+  if (status === 'WAITING_MANUAL_RETRY') return 'Gagal dikirim. Ketuk untuk kirim ulang.';
+  if (status === 'LOG_PENDING' || status === 'UPLOAD_SUCCESS') return 'File sudah masuk Drive, sedang menyimpan data ke sistem...';
+  if (status === 'SYNC_PENDING') return 'Data tersimpan. Menyinkronkan tampilan aplikasi...';
+  if (status === 'FAILED_LOG') return 'Data belum tersimpan ke sistem. Simpan Data ke Sistem.';
+  if (status === 'FAILED_UPLOAD_MANUAL') return 'Gagal dikirim. Periksa koneksi atau coba lagi.';
+  if (status === 'FAILED_LOG_MANUAL') return 'File masuk Drive, data belum tersimpan ke sistem. Simpan Data ke Sistem.';
+  if (status === 'NEED_USER_ACTION') return 'Butuh tindakan. Pilih coba lagi, simpan nanti, atau hapus.';
+  if (status === 'FINAL_SYNCED') return 'Tersimpan final.';
+  if (status === 'DONE') return 'Terkirim.';
+  return item && item.errorMessage ? item.errorMessage : 'Menunggu...';
+}
+
+// =========================================================================
+// 5. RETRY LOGIC — Max 2 Auto + Manual
+// =========================================================================
+var RETRY_DELAYS = [2000, 4000]; // 2 detik, 4 detik
+var MAX_AUTO_RETRY = 2;
+var LOG_RETRY_DELAYS = [3000, 6000]; // 3 detik, 6 detik
+var MAX_LOG_AUTO_RETRY = 2;
+
+// Active retry timers per localId — prevents double retry
+var _activeRetryTimers = {};
+
+function scheduleAutoRetryItem(localId, attemptNum) {
+  if (attemptNum > MAX_AUTO_RETRY) return;
+  if (_activeRetryTimers[localId]) clearTimeout(_activeRetryTimers[localId]);
+
+  var delay = RETRY_DELAYS[attemptNum - 1] || 4000;
+
+  updateLocalItem(localId, {
+    status: 'RETRY_' + attemptNum + '_WAITING',
+    errorMessage: 'Mencoba ulang ' + attemptNum + '/' + MAX_AUTO_RETRY + ' dalam ' + Math.round(delay / 1000) + ' detik'
+  }).then(function() {
+    renderLocalThumbnails();
+    _activeRetryTimers[localId] = setTimeout(function() {
+      delete _activeRetryTimers[localId];
+      executeRetryUpload(localId, false);
+    }, delay);
+  });
+}
+
+function cancelAutoRetryItem(localId) {
+  if (_activeRetryTimers[localId]) {
+    clearTimeout(_activeRetryTimers[localId]);
+    delete _activeRetryTimers[localId];
+  }
+}
+
+// =========================================================================
+// 6. UPLOAD PIPELINE — Core Upload Flow
+// =========================================================================
+var _uploadPipelineActive = false;
+var _currentCredentials = null;
+var _credentialMetaKey = '';
+var _credentialsExpiresAt = 0;
+var _credentialRefreshPromise = null;
+var TOKEN_REFRESH_EARLY_MS = 5 * 60 * 1000;
+var TOKEN_DEFAULT_TTL_MS = 50 * 60 * 1000;
+
+function resetUploadTokenManager(meta) {
+  _currentCredentials = null;
+  _credentialMetaKey = meta ? buildCredentialMetaKey(meta) : '';
+  _credentialsExpiresAt = 0;
+  _credentialRefreshPromise = null;
+}
+
+function buildCredentialMetaKey(meta) {
+  meta = meta || {};
+  return [
+    meta.sessionId || '',
+    meta.containerId || '',
+    meta.uploadType || '',
+    meta.fleetNo || ''
+  ].join('|');
+}
+
+async function ensureManagedUploadCredentials(meta, forceRefresh) {
+  var key = buildCredentialMetaKey(meta);
+  var now = Date.now();
+  if (_credentialRefreshPromise) return _credentialRefreshPromise;
+  if (!forceRefresh && _currentCredentials && _credentialMetaKey === key && now < (_credentialsExpiresAt - TOKEN_REFRESH_EARLY_MS)) {
+    return _currentCredentials;
+  }
+
+  _credentialRefreshPromise = getUploadCredentials(meta).then(function(credentials) {
+    _currentCredentials = credentials;
+    _credentialMetaKey = key;
+    var ttlMs = credentials && credentials.expiresIn ? Number(credentials.expiresIn) * 1000 : TOKEN_DEFAULT_TTL_MS;
+    _credentialsExpiresAt = Date.now() + ttlMs;
+    return _currentCredentials;
+  }).finally(function() {
+    _credentialRefreshPromise = null;
+  });
+
+  return _credentialRefreshPromise;
+}
+
+function createFolderMissingError(uploadType) {
+  var err = new Error('Folder untuk ' + uploadType + ' tidak ditemukan');
+  err.status = 404;
+  return err;
+}
+
+function createTimeoutError() {
+  var err = new Error('Jaringan lambat, request upload melebihi batas waktu');
+  err.status = 408;
+  return err;
+}
+
+function driveUploadWithTimeout(item, folderId, token) {
+  return new Promise(function(resolve, reject) {
+    var done = false;
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var slowTimer = setTimeout(function() {
+      if (done) return;
+      updateLocalItem(item.localId, {
+        status: 'SLOW_NETWORK',
+        errorMessage: 'Jaringan lambat, masih mencoba...'
+      }).then(function() {
+        renderLocalThumbnails();
+        renderUploadTrackerV2();
+      });
+    }, DRIVE_SLOW_NOTICE_MS);
+    var timeoutTimer = setTimeout(function() {
+      if (done) return;
+      done = true;
+      clearTimeout(slowTimer);
+      if (controller) {
+        try { controller.abort(); } catch(e) {}
+      }
+      reject(createTimeoutError());
+    }, DRIVE_UPLOAD_TIMEOUT_MS);
+
+    directUploadToDrive(item.blob, item.fileName, folderId, token, null, controller ? { signal: controller.signal } : null)
+      .then(function(fileId) {
+        if (done) return;
+        done = true;
+        clearTimeout(slowTimer);
+        clearTimeout(timeoutTimer);
+        resolve(fileId);
+      })
+      .catch(function(err) {
+        if (done) return;
+        done = true;
+        clearTimeout(slowTimer);
+        clearTimeout(timeoutTimer);
+        reject(err);
+      });
+  });
+}
+
+async function uploadFileWithManagedToken(item) {
+  await ensureOnlineBeforeUpload(item.localId);
+  var credentials = await ensureManagedUploadCredentials(item.meta, false);
+  var folderId = credentials && credentials.folderIds ? credentials.folderIds[item.uploadType] : '';
+  if (!folderId) throw createFolderMissingError(item.uploadType);
+
+  try {
+    return await driveUploadWithTimeout(item, folderId, credentials.token);
+  } catch (e) {
+    if (e && e.status === 401) {
+      credentials = await ensureManagedUploadCredentials(item.meta, true);
+      folderId = credentials && credentials.folderIds ? credentials.folderIds[item.uploadType] : '';
+      if (!folderId) throw createFolderMissingError(item.uploadType);
+      return await driveUploadWithTimeout(item, folderId, credentials.token);
+    }
+    throw e;
+  }
+}
+
+async function deprecatedExecuteBatchUploadLegacy_(batch) {
+  // Update batch status
+  batch.status = 'IN_PROGRESS';
+  await _idbPut(STORE_BATCH, batch);
+
+  // Get all items for this batch
+  var items = await getLocalQueue({ batchId: batch.batchId });
+  items = items.filter(function(i) {
+    return i.status === 'WAITING_BATCH' || i.status === 'READY_TO_UPLOAD';
+  });
+
+  if (items.length === 0) {
+    batch.status = 'COMPLETED';
+    batch.completedAt = Date.now();
+    await _idbPut(STORE_BATCH, batch);
+    return;
+  }
+
+  // Get credentials
+  if (!_currentCredentials) {
+    try {
+      _currentCredentials = await getUploadCredentials(items[0].meta);
+    } catch (e) {
+      // All items in batch fail — retryable
+      for (var fi = 0; fi < items.length; fi++) {
+        await updateLocalItem(items[fi].localId, {
+          status: 'WAITING_MANUAL_RETRY',
+          attempts: items[fi].attempts + 1,
+          errorMessage: 'Gagal mendapat akses Drive: ' + (e.message || e),
+          errorType: 'RETRYABLE'
+        });
+      }
+      batch.status = 'FAILED';
+      batch.failedCount = items.length;
+      await _idbPut(STORE_BATCH, batch);
+      renderLocalThumbnails();
+      renderUploadTrackerV2();
+      return;
+    }
+  }
+
+  // Parallel upload workers
+  var cursor = 0;
+  var successItems = [];
+  var concurrency = Math.min(UPLOAD_PARALLEL, items.length);
+
+  async function worker() {
+    while (cursor < items.length) {
+      var idx = cursor++;
+      var item = items[idx];
+
+      await updateLocalItem(item.localId, { status: 'UPLOADING' });
+      renderLocalThumbnails();
+
+      var folderId = _currentCredentials.folderIds[item.uploadType];
+      if (!folderId) {
+        await updateLocalItem(item.localId, {
+          status: 'FAILED_UPLOAD',
+          errorMessage: 'Folder untuk ' + item.uploadType + ' tidak ditemukan',
+          errorType: 'PERMANENT'
+        });
+        batch.failedCount++;
+        renderLocalThumbnails();
+        continue;
+      }
+
+      try {
+        var fileId = await directUploadToDrive(
+          item.blob, item.fileName, folderId, _currentCredentials.token, item.meta
+        );
+        if (!fileId || typeof fileId !== 'string' || !fileId.trim()) {
+          throw new Error('Drive API return fileId kosong');
+        }
+        fileId = fileId.trim();
+
+        await updateLocalItem(item.localId, {
+          status: 'UPLOAD_SUCCESS',
+          fileId: fileId,
+          attempts: item.attempts + 1
+        });
+        batch.uploadedCount++;
+        successItems.push(item.localId);
+
+      } catch (e) {
+        var classified = classifyDriveError(e);
+        var newAttempts = item.attempts + 1;
+
+        if (classified.type === 'RETRYABLE' && newAttempts <= MAX_AUTO_RETRY) {
+          // Schedule auto retry
+          await updateLocalItem(item.localId, {
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'RETRYABLE'
+          });
+          scheduleAutoRetryItem(item.localId, newAttempts);
+        } else if (classified.type === 'RETRYABLE') {
+          // Max auto retry reached — manual retry
+          await updateLocalItem(item.localId, {
+            status: 'WAITING_MANUAL_RETRY',
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'RETRYABLE'
+          });
+          batch.failedCount++;
+        } else {
+          // Permanent error
+          await updateLocalItem(item.localId, {
+            status: 'FAILED_UPLOAD',
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'PERMANENT'
+          });
+          batch.failedCount++;
+        }
+      }
+
+      await _idbPut(STORE_BATCH, batch);
+      renderUploadTrackerV2();
+      renderLocalThumbnails();
+    }
+  }
+
+  var workers = [];
+  for (var w = 0; w < concurrency; w++) workers.push(worker());
+  await Promise.all(workers);
+
+  // === LOG TO SHEET per batch ===
+  if (successItems.length > 0) {
+    await flushBatchLog(batch, successItems);
+  }
+
+  // Update batch final status
+  if (batch.failedCount === 0 && batch.uploadedCount === batch.totalItems) {
+    batch.status = 'COMPLETED';
+  } else if (batch.uploadedCount > 0) {
+    batch.status = 'PARTIAL_FAIL';
+  } else {
+    batch.status = 'FAILED';
+  }
+  batch.completedAt = Date.now();
+  await _idbPut(STORE_BATCH, batch);
+}
+
+async function executeBatchUpload(batch, job) {
+  var traceId = (job && job.traceId) || batch.traceId || '';
+  crudTrace('uploadPhoto', traceId, 'batch_start', { batchId: batch.batchId, total: batch.totalItems });
+  batch.status = 'IN_PROGRESS';
+  batch.phase = 'Mengambil akses Drive';
+  setUploadJobStatus(job || _activeUploadJob, 'UPLOADING');
+  setActiveBatchProgress(batch, batch.phase, 0, batch.totalItems);
+  await _idbPut(STORE_BATCH, batch);
+  renderUploadTrackerV2();
+
+  var items = await getLocalQueue({ batchId: batch.batchId });
+  items = items.filter(function(i) {
+    return i.status === 'WAITING_BATCH' || i.status === 'READY_TO_UPLOAD';
+  });
+
+  if (items.length === 0) {
+    batch.status = 'COMPLETED';
+    batch.phase = 'Selesai';
+    batch.completedAt = Date.now();
+    await _idbPut(STORE_BATCH, batch);
+    return;
+  }
+
+  if (!navigator.onLine) {
+    await ensureOnlineBeforeUpload(items[0].localId);
+  }
+
+  try {
+    crudTrace('uploadPhoto', traceId, 'drive_credentials_start', { batchId: batch.batchId });
+    await ensureManagedUploadCredentials(items[0].meta, false);
+    crudTrace('uploadPhoto', traceId, 'drive_credentials_end', { batchId: batch.batchId });
+  } catch (e) {
+    crudTrace('uploadPhoto', traceId, 'drive_credentials_error', { batchId: batch.batchId, message: e && e.message ? e.message : String(e) });
+    for (var fi = 0; fi < items.length; fi++) {
+      var failAttempts = items[fi].attempts + 1;
+      await updateLocalItem(items[fi].localId, {
+        attempts: failAttempts,
+        errorMessage: 'Gagal mendapat akses Drive: ' + (e.message || e),
+        errorType: 'RETRYABLE'
+      });
+      if (failAttempts <= MAX_AUTO_RETRY) {
+        scheduleAutoRetryItem(items[fi].localId, failAttempts);
+      } else {
+        await updateLocalItem(items[fi].localId, { status: 'WAITING_MANUAL_RETRY' });
+      }
+    }
+    batch.status = 'FAILED';
+    batch.phase = 'Sebagian gagal';
+    batch.failedCount = items.length;
+    await _idbPut(STORE_BATCH, batch);
+    setUploadJobStatus(job || _activeUploadJob, 'PARTIAL_FAILED');
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+    return;
+  }
+
+  batch.phase = 'Mengirim foto';
+  setActiveBatchProgress(batch, batch.phase, 0, items.length);
+  await _idbPut(STORE_BATCH, batch);
+
+  var cursor = 0;
+  var successItems = [];
+  var completedInBatch = 0;
+  var concurrency = Math.min(UPLOAD_PARALLEL, items.length);
+  crudTrace('uploadPhoto', traceId, 'drive_upload_start', { batchId: batch.batchId, items: items.length });
+
+  async function worker() {
+    while (cursor < items.length) {
+      var idx = cursor++;
+      var item = items[idx];
+
+      await updateLocalItem(item.localId, { status: 'UPLOADING' });
+      renderLocalThumbnails();
+
+      try {
+        var fileId = await uploadFileWithManagedToken(item);
+        if (!fileId || typeof fileId !== 'string' || !fileId.trim()) {
+          throw new Error('Drive API return fileId kosong');
+        }
+        fileId = fileId.trim();
+
+        await updateLocalItem(item.localId, {
+          status: 'UPLOAD_SUCCESS',
+          fileId: fileId,
+          attempts: item.attempts + 1
+        });
+        batch.uploadedCount++;
+        successItems.push(item.localId);
+
+      } catch (e) {
+        var classified = classifyDriveError(e);
+        var newAttempts = item.attempts + 1;
+
+        if (classified.type === 'RETRYABLE' && newAttempts <= MAX_AUTO_RETRY) {
+          await updateLocalItem(item.localId, {
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'RETRYABLE'
+          });
+          scheduleAutoRetryItem(item.localId, newAttempts);
+        } else if (classified.type === 'RETRYABLE') {
+          await updateLocalItem(item.localId, {
+            status: 'WAITING_MANUAL_RETRY',
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'RETRYABLE'
+          });
+          batch.failedCount++;
+        } else {
+          await updateLocalItem(item.localId, {
+            status: 'FAILED_UPLOAD',
+            attempts: newAttempts,
+            errorMessage: classified.message,
+            errorType: 'PERMANENT'
+          });
+          batch.failedCount++;
+        }
+      }
+
+      completedInBatch++;
+      setActiveBatchProgress(batch, batch.phase, completedInBatch, items.length);
+      await _idbPut(STORE_BATCH, batch);
+      renderUploadTrackerV2();
+      renderLocalThumbnails();
+    }
+  }
+
+  var workers = [];
+  for (var w = 0; w < concurrency; w++) workers.push(worker());
+  await Promise.all(workers);
+  crudTrace('uploadPhoto', traceId, 'drive_upload_end', { batchId: batch.batchId, uploaded: successItems.length, failed: batch.failedCount || 0 });
+
+  if (successItems.length > 0) {
+      batch.phase = 'Menyimpan data ke sistem';
+    setUploadJobStatus(job || _activeUploadJob, 'LOG_PENDING');
+    setActiveBatchProgress(batch, batch.phase, successItems.length, successItems.length);
+    await _idbPut(STORE_BATCH, batch);
+    renderUploadTrackerV2();
+    await flushBatchLog(batch, successItems);
+  }
+
+  if (batch.syncPendingCount > 0) {
+    batch.status = 'SYNC_PENDING';
+    batch.phase = 'Menunggu sinkronisasi tampilan';
+    setUploadJobStatus(job || _activeUploadJob, 'SYNC_PENDING', { syncPendingCount: batch.syncPendingCount });
+  } else if (batch.failedCount === 0 && batch.loggedCount === batch.totalItems) {
+    batch.status = 'COMPLETED';
+    batch.phase = 'Selesai';
+  } else if (batch.uploadedCount > 0 || batch.failedCount > 0) {
+    batch.status = 'PARTIAL_FAIL';
+    batch.phase = 'Sebagian gagal';
+    setUploadJobStatus(job || _activeUploadJob, 'PARTIAL_FAILED');
+  } else {
+    batch.status = 'FAILED';
+    batch.phase = 'Gagal';
+    setUploadJobStatus(job || _activeUploadJob, 'FAILED');
+  }
+  batch.completedAt = Date.now();
+  await _idbPut(STORE_BATCH, batch);
+}
+
+// Execute a single retry for a specific item
+async function deprecatedExecuteRetryUploadLegacy_(localId) {
+  var item = await _idbGet(STORE_QUEUE, localId);
+  if (!item) return;
+  if (item.status === 'UPLOADING') return; // Already uploading, skip
+
+  await updateLocalItem(localId, { status: 'UPLOADING' });
+  renderLocalThumbnails();
+
+  // Get fresh credentials
+  try {
+    _currentCredentials = await getUploadCredentials(item.meta);
+  } catch (e) {
+    var newAttempts = item.attempts + 1;
+    if (newAttempts <= MAX_AUTO_RETRY) {
+      scheduleAutoRetryItem(localId, newAttempts);
+    } else {
+      await updateLocalItem(localId, {
+        status: 'WAITING_MANUAL_RETRY',
+        attempts: newAttempts,
+        errorMessage: 'Gagal mendapat akses Drive',
+        errorType: 'RETRYABLE'
+      });
+    }
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+    return;
+  }
+
+  var folderId = _currentCredentials.folderIds[item.uploadType];
+  if (!folderId) {
+    await updateLocalItem(localId, {
+      status: 'FAILED_UPLOAD',
+      errorMessage: 'Folder tidak ditemukan',
+      errorType: 'PERMANENT'
+    });
+    renderLocalThumbnails();
+    return;
+  }
+
+  try {
+    var fileId = await directUploadToDrive(
+      item.blob, item.fileName, folderId, _currentCredentials.token, item.meta
+    );
+    if (!fileId || typeof fileId !== 'string' || !fileId.trim()) {
+      throw new Error('Drive API return fileId kosong');
+    }
+    fileId = fileId.trim();
+
+    await updateLocalItem(localId, {
+      status: 'UPLOAD_SUCCESS',
+      fileId: fileId
+    });
+
+    // Log to sheet
+    await logSingleItemToSheet(localId);
+
+  } catch (e) {
+    var classified = classifyDriveError(e);
+    var attempts = item.attempts + 1;
+    await updateLocalItem(localId, { attempts: attempts });
+
+    if (classified.type === 'RETRYABLE' && attempts <= MAX_AUTO_RETRY) {
+      scheduleAutoRetryItem(localId, attempts);
+    } else {
+      await updateLocalItem(localId, {
+        status: 'WAITING_MANUAL_RETRY',
+        errorMessage: classified.message,
+        errorType: classified.type
+      });
+    }
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+// =========================================================================
+// 7. LOG TO SHEET — Per Batch with Retry
+// =========================================================================
+
+async function executeRetryUpload(localId, isManual) {
+  var item = await _idbGet(STORE_QUEUE, localId);
+  if (!item) return;
+  if (isPaletMissingDetails_(item) && (item.blob || item.fileId || item.status !== 'FAILED_UPLOAD')) {
+    if (!isManual) {
+      await markPaletItemsNeedUserAction_([item]);
+      renderLocalThumbnails();
+      renderUploadTrackerV2();
+      return;
+    }
+    var draftKeySuffix = getPaletDraftSuffixForItems_([item], 'item_' + localId);
+    var paletDetails = await promptPaletDetailsWithDraft([item], draftKeySuffix);
+    if (!paletDetails) {
+      await markPaletItemsNeedUserAction_([item]);
+      renderLocalThumbnails();
+      renderUploadTrackerV2();
+      return;
+    }
+    var updatedItems = await applyPaletDetailsToLocalItems_([item], paletDetails, draftKeySuffix);
+    item = (updatedItems && updatedItems[0]) || await _idbGet(STORE_QUEUE, localId);
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+    if (!item) return;
+  }
+  if (item.status === 'UPLOADING') return;
+  if (item.status === 'SYNC_PENDING') {
+    await finalizeSyncPendingItems(item.jobId, true);
+    return;
+  }
+  if (item.fileId && (item.status === 'FAILED_LOG' || item.status === 'FAILED_LOG_MANUAL' || item.status === 'NEED_USER_ACTION' || item.status === 'UPLOAD_SUCCESS' || item.status === 'LOG_PENDING' || item.failureStage === 'log')) {
+    await logSingleItemToSheet(localId, isManual);
+    return;
+  }
+  if (!item.blob) {
+    await updateLocalItem(localId, {
+      status: 'FAILED_UPLOAD',
+      failureStage: 'upload',
+      errorMessage: 'File lokal tidak tersedia. Pilih ulang foto dari kamera/galeri.',
+      errorType: 'PERMANENT'
+    });
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+    return;
+  }
+
+  await updateLocalItem(localId, { status: 'UPLOADING' });
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+
+  try {
+    var fileId = await uploadFileWithManagedToken(item);
+    if (!fileId || typeof fileId !== 'string' || !fileId.trim()) {
+      throw new Error('Drive API return fileId kosong');
+    }
+    fileId = fileId.trim();
+
+    await updateLocalItem(localId, {
+      status: 'UPLOAD_SUCCESS',
+      fileId: fileId
+    });
+
+    await logSingleItemToSheet(localId);
+
+  } catch (e) {
+    var classified = classifyDriveError(e);
+    var attempts = item.attempts + 1;
+    await updateLocalItem(localId, { attempts: attempts });
+
+    if (!isManual && classified.type === 'RETRYABLE' && attempts <= MAX_AUTO_RETRY) {
+      scheduleAutoRetryItem(localId, attempts);
+    } else {
+      await updateLocalItem(localId, {
+        status: isManual ? 'NEED_USER_ACTION' : (classified.type === 'PERMANENT' ? 'FAILED_UPLOAD' : 'WAITING_MANUAL_RETRY'),
+        failureStage: isManual ? 'upload' : '',
+        manualStatus: isManual ? 'FAILED_UPLOAD_MANUAL' : '',
+        errorMessage: classified.message,
+        errorType: classified.type
+      });
+      if (isManual) showUploadItemActions(localId);
+    }
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+async function flushBatchLog(batch, successLocalIds) {
+  // Gather all success items
+  var logItems = [];
+  for (var i = 0; i < successLocalIds.length; i++) {
+    var item = await _idbGet(STORE_QUEUE, successLocalIds[i]);
+    if (!item || !item.fileId) continue;
+    await updateLocalItem(item.localId, { status: 'LOG_PENDING' });
+    logItems.push({
+      localId: item.localId,
+      jobId: item.jobId || batch.jobId || (item.meta && item.meta.jobId) || '',
+      sessionId: item.sessionId || (item.meta && item.meta.sessionId) || '',
+      fileId: item.fileId,
+      containerId: item.containerId,
+      type: item.uploadType,
+      fileName: item.fileName,
+      paletName: (item.meta && item.meta.paletName) || '',
+      paletKoli: (item.meta && item.meta.paletKoli) || ''
+    });
+  }
+
+  if (logItems.length === 0) return;
+
+  var firstItem = await _idbGet(STORE_QUEUE, successLocalIds[0]);
+  var meta = firstItem ? firstItem.meta : {};
+  var traceId = meta && meta.traceId;
+  crudTrace('uploadPhoto', traceId, 'log_sheet_client_start', { batchId: batch.batchId, items: logItems.length });
+
+  // Try logging with auto retry
+  var logSuccess = false;
+  var lastLogRes = null;
+  for (var attempt = 0; attempt <= MAX_LOG_AUTO_RETRY; attempt++) {
+    try {
+      crudTrace('uploadPhoto', traceId, 'log_sheet_client_attempt', { attempt: attempt + 1 });
+      var logRes = assertGasSuccess(await gasRun('logDirectUploads', [{ meta: meta, items: logItems }], 30000), 'Log ke Sheet gagal');
+      lastLogRes = logRes;
+      crudTrace('uploadPhoto', traceId, 'log_sheet_server_ack', {
+        rowsWritten: logRes.rowsWritten,
+        duplicateCount: logRes.duplicateCount,
+        invalidCount: logRes.invalidCount
+      });
+      logSuccess = true;
+      break;
+    } catch (e) {
+      if (attempt < MAX_LOG_AUTO_RETRY) {
+        var delay = LOG_RETRY_DELAYS[attempt] || 6000;
+        await new Promise(function(r) { setTimeout(r, delay); });
+      }
+    }
+  }
+
+  if (logSuccess) {
+    crudTrace('uploadPhoto', traceId, 'log_sheet_client_success', { batchId: batch.batchId, items: successLocalIds.length });
+    showDrivePublicWarning_(lastLogRes && lastLogRes.publicWarning);
+    // Data sudah masuk Sheet; tahan thumbnail lokal sampai hasil sync menampilkan fileId yang sama.
+    for (var si = 0; si < successLocalIds.length; si++) {
+      await updateLocalItem(successLocalIds[si], { status: 'SYNC_PENDING' });
+    }
+    batch.loggedCount = (batch.loggedCount || 0) + successLocalIds.length;
+    await _idbPut(STORE_BATCH, batch);
+
+    batch.phase = 'Sinkronisasi tampilan';
+    setActiveBatchProgress(batch, batch.phase, successLocalIds.length, successLocalIds.length);
+    var finalSync = await finalizeLoggedItemsAfterSync_(successLocalIds, logItems, _activeUploadJob, traceId);
+    batch.syncPendingCount = finalSync.pendingCount || 0;
+    if (finalSync.success) {
+      batch.phase = 'Tersimpan final';
+    } else {
+      batch.status = 'SYNC_PENDING';
+      batch.phase = 'Menunggu sinkronisasi tampilan';
+      setUploadJobStatus(_activeUploadJob, 'SYNC_PENDING', { syncPendingCount: batch.syncPendingCount });
+    }
+    await _idbPut(STORE_BATCH, batch);
+  } else {
+    crudTrace('uploadPhoto', traceId, 'log_sheet_client_pending_queue', { batchId: batch.batchId, items: logItems.length });
+    // Log failed — move to pending log queue
+    for (var pi = 0; pi < logItems.length; pi++) {
+      var pendingItem = {
+        localId: logItems[pi].localId,
+        batchId: batch.batchId,
+        jobId: batch.jobId || meta.jobId || '',
+        sessionId: meta.sessionId || '',
+        containerId: logItems[pi].containerId,
+        uploadType: logItems[pi].type,
+        fileId: logItems[pi].fileId,
+        fileName: logItems[pi].fileName,
+        paletName: logItems[pi].paletName || '',
+        paletKoli: logItems[pi].paletKoli || '',
+        meta: meta,
+        attempts: MAX_LOG_AUTO_RETRY + 1,
+        status: 'FAILED',
+        errorMessage: 'Data gagal tersimpan ke sistem setelah ' + (MAX_LOG_AUTO_RETRY + 1) + ' percobaan',
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+      await _idbPut(STORE_PENDING_LOG, pendingItem);
+      await updateLocalItem(logItems[pi].localId, { status: 'FAILED_LOG' });
+    }
+    batch.failedCount = (batch.failedCount || 0) + logItems.length;
+    batch.status = 'PARTIAL_FAIL';
+    batch.phase = 'Data pending';
+    setUploadJobStatus(_activeUploadJob, 'PARTIAL_FAILED');
+    await _idbPut(STORE_BATCH, batch);
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+async function logSingleItemToSheet(localId, isManual) {
+  var item = await _idbGet(STORE_QUEUE, localId);
+  if (!item || !item.fileId) return;
+
+  await updateLocalItem(localId, { status: 'LOG_PENDING' });
+
+  var logItem = {
+    localId: item.localId || localId,
+    jobId: item.jobId || (item.meta && item.meta.jobId) || '',
+    sessionId: item.sessionId || (item.meta && item.meta.sessionId) || '',
+    fileId: item.fileId,
+    containerId: item.containerId,
+    type: item.uploadType,
+    fileName: item.fileName,
+    paletName: (item.meta && item.meta.paletName) || '',
+    paletKoli: (item.meta && item.meta.paletKoli) || ''
+  };
+
+  var logSuccess = false;
+  var lastLogRes = null;
+  for (var attempt = 0; attempt <= MAX_LOG_AUTO_RETRY; attempt++) {
+    try {
+      var logRes = assertGasSuccess(await gasRun('logDirectUploads', [{ meta: item.meta, items: [logItem] }], 30000), 'Log ke Sheet gagal');
+      lastLogRes = logRes;
+      crudTrace('uploadPhoto', item.meta && item.meta.traceId, 'log_sheet_server_ack_single', {
+        rowsWritten: logRes.rowsWritten,
+        duplicateCount: logRes.duplicateCount,
+        invalidCount: logRes.invalidCount
+      });
+      logSuccess = true;
+      break;
+    } catch (e) {
+      if (attempt < MAX_LOG_AUTO_RETRY) {
+        await new Promise(function(r) { setTimeout(r, LOG_RETRY_DELAYS[attempt] || 6000); });
+      }
+    }
+  }
+
+  if (logSuccess) {
+    showDrivePublicWarning_(lastLogRes && lastLogRes.publicWarning);
+    await updateLocalItem(localId, { status: 'SYNC_PENDING' });
+    var finalSync = await finalizeLoggedItemsAfterSync_([localId], [logItem], _activeUploadJob, item.meta && item.meta.traceId);
+    if (!finalSync.success) {
+      setUploadJobStatus(_activeUploadJob, 'SYNC_PENDING', { syncPendingCount: finalSync.pendingCount || 1 });
+    }
+  } else {
+    await _idbPut(STORE_PENDING_LOG, {
+      localId: localId,
+      batchId: item.batchId,
+      jobId: item.jobId || (item.meta && item.meta.jobId) || '',
+      sessionId: item.sessionId,
+      containerId: item.containerId,
+      uploadType: item.uploadType,
+      fileId: item.fileId,
+      fileName: item.fileName,
+      paletName: (item.meta && item.meta.paletName) || '',
+      paletKoli: (item.meta && item.meta.paletKoli) || '',
+      meta: item.meta,
+      attempts: MAX_LOG_AUTO_RETRY + 1,
+      status: 'FAILED',
+      errorMessage: 'Data gagal tersimpan ke sistem',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    await updateLocalItem(localId, {
+      status: isManual ? 'NEED_USER_ACTION' : 'FAILED_LOG',
+      failureStage: 'log',
+      manualStatus: isManual ? 'FAILED_LOG_MANUAL' : '',
+      errorMessage: isManual ? 'File masuk Drive, data belum tersimpan ke sistem. Simpan Data ke Sistem.' : 'Data belum tersimpan ke sistem. Simpan Data ke Sistem.'
+    });
+    if (isManual) showUploadItemActions(localId);
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+// Retry all pending logs
+async function deprecatedRetryPendingLogsLegacy_() {
+  var pending = await _idbGetAll(STORE_PENDING_LOG);
+  if (pending.length === 0) {
+    Toast.fire({ icon: 'info', title: 'Tidak ada data pending' });
+    return;
+  }
+
+  // Group by batch/session for efficient logging
+  var metaFirst = pending[0].meta || {};
+  var logItems = pending.map(function(p) {
+    return {
+      localId: p.localId || '',
+      jobId: p.jobId || (p.meta && p.meta.jobId) || '',
+      fileId: p.fileId,
+      containerId: p.containerId,
+      type: p.uploadType,
+      fileName: p.fileName,
+      paletName: (p.meta && p.meta.paletName) || '',
+      paletKoli: (p.meta && p.meta.paletKoli) || ''
+    };
+  });
+
+  try {
+    var logRes = assertGasSuccess(await gasRun('logDirectUploads', [{ meta: metaFirst, items: logItems }], 30000), 'Log ke Sheet gagal');
+    crudTrace('uploadPhoto', metaFirst && metaFirst.traceId, 'log_sheet_server_ack_legacy_retry', {
+      rowsWritten: logRes.rowsWritten,
+      duplicateCount: logRes.duplicateCount,
+      invalidCount: logRes.invalidCount
+    });
+    // Success — clean up
+    for (var i = 0; i < pending.length; i++) {
+      await _idbDelete(STORE_PENDING_LOG, pending[i].localId);
+      await updateLocalItem(pending[i].localId, { status: 'DONE' });
+      var queueItem = await _idbGet(STORE_QUEUE, pending[i].localId);
+      if (queueItem && queueItem.previewUrl) {
+        try { URL.revokeObjectURL(queueItem.previewUrl); } catch(e) {}
+      }
+      await removeFromLocal(pending[i].localId);
+    }
+    lastSyncHash = '';
+    cloudSync(true);
+    Toast.fire({ icon: 'success', title: pending.length + ' data berhasil disimpan' });
+  } catch (e) {
+    Toast.fire({ icon: 'error', title: 'Gagal menyimpan data', text: e.message || '' });
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+async function retryPendingLogs(jobId, isManual) {
+  var pending = await _idbGetAll(STORE_PENDING_LOG);
+  if (jobId) {
+    pending = pending.filter(function(p) { return p.jobId === jobId || (p.meta && p.meta.jobId === jobId); });
+  }
+  if (pending.length === 0) {
+    Toast.fire({ icon: 'info', title: 'Tidak ada data pending' });
+    return;
+  }
+
+  var groups = {};
+  pending.forEach(function(p) {
+    var key = [
+      p.sessionId || (p.meta && p.meta.sessionId) || '',
+      p.containerId || '',
+      p.uploadType || '',
+      p.batchId || ''
+    ].join('|');
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(p);
+  });
+
+  var saved = 0;
+  var failed = 0;
+  var syncPending = 0;
+  var keys = Object.keys(groups);
+
+  for (var g = 0; g < keys.length; g++) {
+    var group = groups[keys[g]];
+    var meta = group[0].meta || {};
+    var logItems = group.map(function(p) {
+      return {
+        localId: p.localId || '',
+        jobId: p.jobId || (p.meta && p.meta.jobId) || '',
+        sessionId: p.sessionId || (p.meta && p.meta.sessionId) || '',
+        fileId: p.fileId,
+        containerId: p.containerId,
+        type: p.uploadType,
+        fileName: p.fileName,
+        paletName: p.paletName || (p.meta && p.meta.paletName) || '',
+        paletKoli: p.paletKoli || (p.meta && p.meta.paletKoli) || ''
+      };
+    });
+
+    try {
+      var logRes = assertGasSuccess(await gasRun('logDirectUploads', [{ meta: meta, items: logItems }], 30000), 'Log ke Sheet gagal');
+      crudTrace('uploadPhoto', meta && meta.traceId, 'log_sheet_server_ack_retry', {
+        rowsWritten: logRes.rowsWritten,
+        duplicateCount: logRes.duplicateCount,
+        invalidCount: logRes.invalidCount
+      });
+      showDrivePublicWarning_(logRes && logRes.publicWarning);
+      var groupLocalIds = [];
+      for (var i = 0; i < group.length; i++) {
+        await _idbDelete(STORE_PENDING_LOG, group[i].localId);
+        await updateLocalItem(group[i].localId, { status: 'SYNC_PENDING' });
+        groupLocalIds.push(group[i].localId);
+      }
+      var finalSync = await finalizeLoggedItemsAfterSync_(groupLocalIds, logItems, _activeUploadJob, meta && meta.traceId);
+      saved += finalSync.finalizedCount || 0;
+      if (!finalSync.success) syncPending += finalSync.pendingCount || 0;
+    } catch (e) {
+      failed += group.length;
+      if (isManual !== false) {
+        for (var fi = 0; fi < group.length; fi++) {
+          await updateLocalItem(group[fi].localId, {
+            status: 'NEED_USER_ACTION',
+            failureStage: 'log',
+            manualStatus: 'FAILED_LOG_MANUAL',
+            errorMessage: 'File masuk Drive, data belum tersimpan ke sistem. Simpan Data ke Sistem.'
+          });
+        }
+      }
+    }
+  }
+
+  if (failed > 0) {
+    Toast.fire({ icon: 'error', title: failed + ' data masih gagal disimpan' });
+  } else if (syncPending > 0) {
+    Toast.fire({ icon: 'warning', title: syncPending + ' foto tersimpan, tampilan belum final' });
+  } else {
+    Toast.fire({ icon: 'success', title: saved + ' data berhasil disimpan' });
+  }
+
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+// =========================================================================
+// 8. MANUAL RETRY HANDLERS
+// =========================================================================
+
+function handleRetryPhoto(localId) {
+  cancelAutoRetryItem(localId);
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) return;
+    if (item.status === 'UPLOADING') return;
+    if (item.status === 'SYNC_PENDING') {
+      finalizeSyncPendingItems(item.jobId, true);
+      return;
+    }
+    if (item.status === 'FAILED_LOG' || item.status === 'FAILED_LOG_MANUAL' || (item.status === 'NEED_USER_ACTION' && item.failureStage === 'log')) {
+      retryPendingLogs(item.jobId, true);
+      return;
+    }
+    executeRetryUpload(localId, true);
+  });
+}
+
+function handleRetryAll(jobId) {
+  getLocalQueue().then(async function(items) {
+    if (jobId) items = items.filter(function(i) { return i.jobId === jobId; });
+    var retryable = items.filter(function(i) {
+      return i.status === 'FAILED_LOG' || isManualActionStatus(i.status);
+    });
+    if (retryable.length === 0) {
+      Toast.fire({ icon: 'info', title: 'Tidak ada foto gagal' });
+      return;
+    }
+
+    // Separate upload failures from log failures
+    var uploadFails = retryable.filter(function(i) { return i.status !== 'FAILED_LOG' && i.failureStage !== 'log'; });
+    var logFails = retryable.filter(function(i) { return i.status === 'FAILED_LOG' || i.failureStage === 'log'; });
+    var paletMissing = sortPaletItemsForPrompt_(uploadFails.filter(isPaletMissingDetails_));
+    if (paletMissing.length > 0) {
+      var draftKeySuffix = getPaletDraftSuffixForItems_(paletMissing, jobId ? ('job_' + jobId) : 'retry_all_' + Date.now());
+      var paletDetails = await promptPaletDetailsWithDraft(paletMissing, draftKeySuffix);
+      if (paletDetails) {
+        await applyPaletDetailsToLocalItems_(paletMissing, paletDetails, draftKeySuffix);
+      } else {
+        await markPaletItemsNeedUserAction_(paletMissing);
+        var missingIds = {};
+        paletMissing.forEach(function(item) { missingIds[item.localId] = true; });
+        uploadFails = uploadFails.filter(function(item) { return !missingIds[item.localId]; });
+      }
+    }
+
+    var cursor = 0;
+    async function retryWorker() {
+      while (cursor < uploadFails.length) {
+        var item = uploadFails[cursor++];
+        cancelAutoRetryItem(item.localId);
+        await executeRetryUpload(item.localId, true);
+      }
+    }
+    var workers = [];
+    for (var w = 0; w < Math.min(UPLOAD_PARALLEL, uploadFails.length); w++) workers.push(retryWorker());
+    await Promise.all(workers);
+
+    if (logFails.length > 0) {
+      retryPendingLogs(jobId, true);
+    }
+  });
+}
+
+function showUploadItemActions(localId) {
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) return;
+    var msg = getUploadStatusMessage(item);
+    Swal.fire({
+      icon: 'warning',
+      title: 'Upload butuh tindakan',
+      html: '<div style="text-align:left">'
+        + '<p style="font-size:13px;color:#475569;margin-bottom:10px">' + escapeHtml(msg) + '</p>'
+        + '<button type="button" onclick="showUploadErrorDetail(\'' + localId + '\')" style="width:100%;padding:9px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;color:#334155;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer">Lihat detail error</button>'
+        + '</div>',
+      showDenyButton: true,
+      showCancelButton: true,
+      confirmButtonText: 'Coba lagi',
+      denyButtonText: 'Simpan nanti',
+      cancelButtonText: 'Hapus dari antrean',
+      customClass: { popup:'custom-swal', confirmButton:'btn-primary', denyButton:'btn-primary', cancelButton:'btn-primary' },
+      buttonsStyling: false
+    }).then(function(result) {
+      if (result.isConfirmed) {
+        handleRetryPhoto(localId);
+      } else if (result.isDenied) {
+        Toast.fire({ icon:'info', title:'Disimpan untuk dicoba nanti' });
+      } else if (result.dismiss === Swal.DismissReason.cancel) {
+        confirmRemoveFromUploadQueue(localId);
+      }
+    });
+  });
+}
+
+function showUploadErrorDetail(localId) {
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) return;
+    Swal.fire({
+      icon: 'info',
+      title: 'Detail error',
+      html: '<div style="text-align:left;font-size:12px;color:#475569;line-height:1.5">'
+        + '<div><b>Status:</b> ' + escapeHtml(item.manualStatus || item.status || '-') + '</div>'
+        + '<div><b>Error:</b> ' + escapeHtml(item.errorMessage || '-') + '</div>'
+        + '<div><b>File:</b> ' + escapeHtml(item.fileName || '-') + '</div>'
+        + '</div>',
+      customClass: { popup:'custom-swal' }
+    });
+  });
+}
+
+var PALET_DRAFT_STORAGE_PREFIX = 'inlens_palet_upload_draft_v1:';
+var PALET_DRAFT_ITEM_PREFIX = 'inlens_palet_upload_item_draft_v1:';
+
+function getPaletDraftKey_(draftKeySuffix) {
+  return PALET_DRAFT_STORAGE_PREFIX + String(draftKeySuffix || 'default');
+}
+
+function getPaletItemDraftKey_(localId) {
+  return PALET_DRAFT_ITEM_PREFIX + String(localId || '');
+}
+
+function readPaletDraftJson_(key) {
+  if (!key) return null;
+  try {
+    var raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writePaletDraftJson_(key, value) {
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {}
+}
+
+function removePaletDraftKey_(key) {
+  if (!key) return;
+  try { localStorage.removeItem(key); } catch (e) {}
+}
+
+function isPaletMissingDetails_(item) {
+  if (!item) return false;
+  var type = item.uploadType || item.category || (item.meta && item.meta.uploadType);
+  var meta = item.meta || {};
+  return type === 'palet' && !cleanPaletName(meta.paletName || item.paletName || '');
+}
+
+function sortPaletItemsForPrompt_(items) {
+  return (items || []).slice().sort(function(a, b) {
+    var ai = Number(a && a.meta && a.meta.sourceIndex);
+    var bi = Number(b && b.meta && b.meta.sourceIndex);
+    if (!isFinite(ai)) ai = 999999;
+    if (!isFinite(bi)) bi = 999999;
+    if (ai !== bi) return ai - bi;
+    return String((a && a.localId) || '').localeCompare(String((b && b.localId) || ''));
+  });
+}
+
+function getPaletDraftSuffixForItems_(items, fallback) {
+  items = items || [];
+  if (items.length === 1 && items[0] && items[0].localId) return 'item_' + items[0].localId;
+  var jobId = '';
+  for (var i = 0; i < items.length; i++) {
+    var current = items[i] && (items[i].jobId || (items[i].meta && items[i].meta.jobId));
+    if (!current) return fallback || 'draft';
+    if (!jobId) jobId = current;
+    if (jobId !== current) return fallback || 'draft';
+  }
+  return jobId ? 'job_' + jobId : (fallback || 'draft');
+}
+
+function getPaletDraftDefaults_(items, draftKeySuffix) {
+  items = items || [];
+  var groupDraft = readPaletDraftJson_(getPaletDraftKey_(draftKeySuffix)) || {};
+  var groupRows = Array.isArray(groupDraft) ? groupDraft : (groupDraft.items || []);
+  var groupByLocalId = {};
+  for (var g = 0; g < groupRows.length; g++) {
+    var row = groupRows[g] || {};
+    if (row.localId) groupByLocalId[row.localId] = row;
+  }
+
+  return items.map(function(item, index) {
+    var localId = item && item.localId;
+    var meta = (item && item.meta) || {};
+    var itemDraft = localId ? (readPaletDraftJson_(getPaletItemDraftKey_(localId)) || {}) : {};
+    var groupRow = (localId && groupByLocalId[localId]) || groupRows[index] || {};
+    var name = meta.paletName || item.paletName || itemDraft.paletName || groupRow.paletName || '';
+    var koli = meta.paletKoli || item.paletKoli || itemDraft.paletKoli || groupRow.paletKoli || '';
+    return {
+      paletName: cleanPaletName(name),
+      paletKoli: cleanPaletKoli(koli) || ''
+    };
+  });
+}
+
+function savePaletDetailsDraft_(items, draftKeySuffix, values) {
+  items = items || [];
+  values = values || [];
+  var rows = values.map(function(value, index) {
+    var item = items[index] || {};
+    var row = {
+      localId: item.localId || '',
+      fileName: item.fileName || '',
+      sourceIndex: item.meta && item.meta.sourceIndex,
+      paletName: cleanPaletName(value && value.paletName),
+      paletKoli: cleanPaletKoli(value && value.paletKoli) || ''
+    };
+    if (row.localId) writePaletDraftJson_(getPaletItemDraftKey_(row.localId), row);
+    return row;
+  });
+  writePaletDraftJson_(getPaletDraftKey_(draftKeySuffix), {
+    updatedAt: Date.now(),
+    items: rows
+  });
+}
+
+function clearPaletDetailsDraft_(items, draftKeySuffix) {
+  removePaletDraftKey_(getPaletDraftKey_(draftKeySuffix));
+  (items || []).forEach(function(item) {
+    if (item && item.localId) removePaletDraftKey_(getPaletItemDraftKey_(item.localId));
+  });
+}
+
+function collectPaletModalValues_() {
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.palet-upload-row'));
+  return rows.map(function(row) {
+    var nameInput = row.querySelector('.palet-name-input');
+    var koliInput = row.querySelector('.palet-koli-input');
+    return {
+      localId: row.getAttribute('data-localid') || '',
+      paletName: cleanPaletName(nameInput ? nameInput.value : ''),
+      paletKoli: cleanPaletKoli(koliInput ? koliInput.value : '') || ''
+    };
+  });
+}
+
+function promptPaletDetailsWithDraft(items, draftKeySuffix) {
+  items = sortPaletItemsForPrompt_(items || []);
+  if (items.length === 0) return Promise.resolve([]);
+  draftKeySuffix = draftKeySuffix || getPaletDraftSuffixForItems_(items, 'draft_' + Date.now());
+  var defaults = getPaletDraftDefaults_(items, draftKeySuffix);
+  var previewUrls = items.map(function(item) { return item.previewUrl || ''; });
+  var rows = items.map(function(item, index) {
+    var defaultName = defaults[index] ? defaults[index].paletName : '';
+    var defaultKoli = defaults[index] ? defaults[index].paletKoli : '';
+    var label = item.fileName || (item.meta && item.meta.originalFileName) || ('Foto ' + (index + 1));
+    var localId = item.localId || '';
+    var rowId = 'palet-row-' + index;
+    return '<div class="palet-upload-row" id="'+rowId+'" data-localid="'+escapeHtml(localId)+'" data-preview-index="'+index+'">'
+      + '<button class="palet-upload-thumb" type="button" data-preview-index="' + index + '" aria-label="Perbesar foto palet ' + (index + 1) + '">'
+      + (item.previewUrl ? '<img src="' + escapeHtml(item.previewUrl) + '" alt="Preview foto palet ' + (index + 1) + '">' : '<span style="display:flex;width:100%;height:100%;align-items:center;justify-content:center;color:#64748b;font-size:11px;font-weight:700">Foto tersimpan</span>')
+      + '<span class="palet-zoom-hint">Zoom</span></button>'
+      + '<div class="palet-upload-body">'
+      +   '<div class="palet-upload-head-top">'
+      +     '<div>'
+      +       '<div class="palet-upload-file"><span class="palet-badge-number">' + (index + 1) + '</span><strong class="palet-title-display" data-original="'+escapeHtml(label)+'">' + escapeHtml(label) + '</strong></div>'
+      +       '<div class="palet-upload-note">Data otomatis tersimpan sebagai draft saat diketik.</div>'
+      +     '</div>'
+      +     '<div class="palet-row-actions">'
+      +       '<button type="button" class="btn-row-action btn-toggle" onclick="window.__togglePaletRow__(\''+rowId+'\')" title="Tutup/Buka Form">'
+      +         '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>'
+      +       '</button>'
+      +       '<button type="button" class="btn-row-action btn-delete" onclick="window.__deletePaletRow__(\''+rowId+'\')" title="Hapus Foto">'
+      +         '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg>'
+      +       '</button>'
+      +     '</div>'
+      +   '</div>'
+      +   '<div class="palet-upload-collapsible">'
+      +     '<div class="palet-upload-fields">'
+      +       '<label><span>Nama/Nomor Palet</span><input class="palet-name-input" type="text" value="' + escapeHtml(defaultName) + '" placeholder="Contoh: A12 / P-07"></label>'
+      +       '<label><span>Jumlah Koli</span><input class="palet-koli-input" type="tel" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="next" aria-required="true" value="' + escapeHtml(defaultKoli) + '" placeholder="0"></label>'
+      +     '</div>'
+      +     '<div class="palet-filename-preview"></div>'
+      +   '</div>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+
+  var actionButtons =
+    '<div class="palet-custom-actions">'
+    + '<button type="button" class="btn-batal" id="palet-btn-batal">Batal</button>'
+    + '<button type="button" class="btn-nanti" id="palet-btn-nanti">Isi Nanti</button>'
+    + '<button type="button" class="btn-kamera" id="palet-btn-kamera">Kamera</button>'
+    + '<button type="button" class="btn-simpan" id="palet-btn-simpan">Simpan</button>'
+    + '</div>';
+
+  return new Promise(function(resolve) {
+    Swal.fire({
+      title: 'Data Palet',
+      html: '<div class="palet-upload-intro"><strong>Foto sudah aman tersimpan di perangkat.</strong><span>Isi nama palet dan koli. Jika halaman tertutup, draft terakhir tetap disimpan.</span></div><div class="palet-upload-modal">' + rows + '</div>' + actionButtons,
+      showConfirmButton: false,
+      showCancelButton: false,
+      showDenyButton: false,
+      allowOutsideClick: false,
+      customClass: { popup:'custom-swal palet-swal' },
+      buttonsStyling: false,
+      width: 'min(760px, calc(100vw - 16px))',
+      didOpen: function() {
+        // Toggle accordion
+        window.__togglePaletRow__ = function(rowId) {
+          var row = document.getElementById(rowId);
+          if (row) row.classList.toggle('is-collapsed');
+        };
+
+        // Delete row permanently
+        window.__deletePaletRow__ = function(rowId) {
+          var row = document.getElementById(rowId);
+          if (!row) return;
+          var localId = row.getAttribute('data-localid');
+          row.remove();
+          // Re-number badges
+          var badges = document.querySelectorAll('.palet-badge-number');
+          badges.forEach(function(badge, idx) { badge.textContent = (idx + 1); });
+          // Delete from IndexedDB permanently
+          if (localId && typeof deleteLocalItem === 'function') {
+            deleteLocalItem(localId).catch(function(e) { console.warn('Delete palet item failed:', e); });
+          }
+          updatePreviewsAndDraft();
+        };
+
+        function updatePreviewsAndDraft() {
+          var values = collectPaletModalValues_();
+          var allRows = document.querySelectorAll('.palet-upload-row');
+          var previews = document.querySelectorAll('.palet-filename-preview');
+          var titles = document.querySelectorAll('.palet-title-display');
+          for (var i = 0; i < values.length; i++) {
+            var pName = values[i].paletName || '';
+            var pKoli = values[i].paletKoli || '';
+            if (previews[i]) {
+              if (!pName || !pKoli) {
+                previews[i].textContent = 'File: isi Nama/Nomor Palet dan Jumlah Koli dulu';
+                previews[i].style.color = '#64748b';
+              } else {
+                var newFileName = 'Palet ' + safeFileSegment(pName) + ' - ' + pKoli + ' Koli.jpg';
+                previews[i].textContent = 'File: ' + newFileName;
+                previews[i].style.color = '#059669';
+                if (titles[i]) titles[i].textContent = newFileName;
+              }
+            }
+            // Restore original title if cleared
+            if (titles[i] && (!pName || !pKoli)) {
+              titles[i].textContent = titles[i].getAttribute('data-original');
+            }
+          }
+          savePaletDetailsDraft_(items, draftKeySuffix, values);
+        }
+
+        document.querySelectorAll('.palet-upload-thumb').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var idx = parseInt(btn.getAttribute('data-preview-index'), 10);
+            if (!isNaN(idx) && previewUrls[idx] && typeof showLightbox === 'function') showLightbox(previewUrls[idx]);
+          });
+        });
+        document.querySelectorAll('.palet-name-input').forEach(function(input) {
+          input.addEventListener('input', function() {
+            input.value = cleanPaletName(input.value);
+            updatePreviewsAndDraft();
+          });
+        });
+        document.querySelectorAll('.palet-koli-input').forEach(function(input) {
+          input.addEventListener('input', function() {
+            input.value = String(input.value || '').replace(/\D+/g, '');
+            updatePreviewsAndDraft();
+          });
+        });
+        updatePreviewsAndDraft();
+
+        // Custom button handlers
+        document.getElementById('palet-btn-batal').addEventListener('click', function() {
+          Swal.close();
+          resolve(null);
+        });
+        document.getElementById('palet-btn-nanti').addEventListener('click', function() {
+          savePaletDetailsDraft_(items, draftKeySuffix, collectPaletModalValues_());
+          Swal.close();
+          resolve('ISI_NANTI');
+        });
+        document.getElementById('palet-btn-kamera').addEventListener('click', function() {
+          savePaletDetailsDraft_(items, draftKeySuffix, collectPaletModalValues_());
+          var camBtn = document.getElementById('file-camera');
+          if (camBtn) camBtn.click();
+          Swal.close();
+          resolve('KAMERA');
+        });
+        document.getElementById('palet-btn-simpan').addEventListener('click', function() {
+          var result = collectPaletModalValues_();
+          var seen = {};
+          for (var i = 0; i < result.length; i++) {
+            if (!result[i].paletName) { Swal.showValidationMessage('Nama palet foto ' + (i + 1) + ' wajib diisi'); return; }
+            if (!result[i].paletKoli) { Swal.showValidationMessage('Jumlah koli foto ' + (i + 1) + ' wajib diisi'); return; }
+            if (seen[result[i].paletName]) { Swal.showValidationMessage('Nama palet dobel: ' + result[i].paletName); return; }
+            seen[result[i].paletName] = true;
+          }
+          savePaletDetailsDraft_(items, draftKeySuffix, result);
+          Swal.close();
+          resolve(result);
+        });
+      }
+    });
+  });
+}
+
+async function applyPaletDetailsToLocalItems_(items, paletDetails, draftKeySuffix) {
+  items = sortPaletItemsForPrompt_(items || []);
+  var updated = [];
+  for (var i = 0; i < items.length; i++) {
+    var detail = paletDetails && paletDetails[i];
+    if (!items[i] || !items[i].localId || !detail) continue;
+    var latest = await _idbGet(STORE_QUEUE, items[i].localId);
+    if (!latest) continue;
+    var meta = JSON.parse(JSON.stringify(latest.meta || {}));
+    meta.paletName = cleanPaletName(detail.paletName);
+    meta.paletKoli = cleanPaletKoli(detail.paletKoli);
+    var sourceIndex = Number(meta.sourceIndex);
+    if (!isFinite(sourceIndex)) sourceIndex = i;
+    var fileName = generatePhotoFileName('palet', sourceIndex, meta);
+    meta.fileName = fileName;
+    var nextStatus = latest.fileId ? 'UPLOAD_SUCCESS' : 'READY_TO_UPLOAD';
+    var updatedItem = await updateLocalItem(latest.localId, {
+      meta: meta,
+      fileName: fileName,
+      status: nextStatus,
+      failureStage: '',
+      manualStatus: '',
+      errorMessage: '',
+      errorType: ''
+    });
+    updated.push(updatedItem || latest);
+  }
+  clearPaletDetailsDraft_(items, draftKeySuffix);
+  return updated;
+}
+
+async function markPaletItemsNeedUserAction_(items) {
+  items = items || [];
+  for (var i = 0; i < items.length; i++) {
+    if (!items[i] || !items[i].localId) continue;
+    await updateLocalItem(items[i].localId, {
+      status: 'NEED_USER_ACTION',
+      failureStage: 'metadata',
+      manualStatus: 'PALET_DETAILS_PENDING',
+      errorMessage: 'Data palet belum lengkap. Ketuk untuk melengkapi.',
+      errorType: 'USER_ACTION_REQUIRED'
+    });
+  }
+}
+
+function confirmRemoveFromUploadQueue(localId) {
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) return;
+    Swal.fire({
+      icon: 'warning',
+      title: 'Hapus dari antrean?',
+      text: 'Foto lokal ini akan dihapus dari antrean upload perangkat ini.',
+      showCancelButton: true,
+      confirmButtonText: 'Ya, hapus',
+      cancelButtonText: 'Batal',
+      customClass: { popup:'custom-swal', confirmButton:'btn-primary', cancelButton:'btn-primary' },
+      buttonsStyling: false
+    }).then(function(result) {
+      if (!result.isConfirmed) return;
+      if (item.previewUrl) { try { URL.revokeObjectURL(item.previewUrl); } catch(e) {} }
+      _idbDelete(STORE_PENDING_LOG, localId).finally(function() {
+        removeFromLocal(localId).then(function() {
+          renderLocalThumbnails();
+          renderUploadTrackerV2();
+        });
+      });
+    });
+  });
+}
+
+// =========================================================================
+// 9. UPLOAD TRACKER V2
+// =========================================================================
+
+function deprecatedRenderUploadTrackerV2Legacy_() {
+  getLocalQueue().then(function(items) {
+    var pending = _idbGetAll(STORE_PENDING_LOG);
+    return pending.then(function(pendingLogs) {
+      return { items: items, pendingLogs: pendingLogs };
+    });
+  }).then(function(data) {
+    var items = data.items;
+    var pendingLogs = data.pendingLogs;
+    var el = document.getElementById('upload-tracker');
+
+    // Count by status
+    var uploading = 0, retrying = 0, failed = 0, logPending = 0, done = 0, total = items.length;
+    items.forEach(function(i) {
+      if (i.status === 'UPLOADING' || i.status === 'COMPRESSING' || i.status === 'READY_TO_UPLOAD') uploading++;
+      else if (i.status.indexOf('RETRY') >= 0) retrying++;
+      else if (i.status === 'WAITING_MANUAL_RETRY' || i.status === 'FAILED_UPLOAD') failed++;
+      else if (i.status === 'FAILED_LOG' || i.status === 'LOG_PENDING') logPending++;
+      else if (i.status === 'DONE') done++;
+    });
+    logPending += pendingLogs.length;
+    failed += pendingLogs.filter(function(p) { return p.status === 'FAILED'; }).length;
+
+    var isActive = uploading > 0 || retrying > 0;
+    var hasIssues = failed > 0 || logPending > 0;
+
+    if (!isActive && !hasIssues && total === 0) {
+      if (el) { el.style.opacity = '0'; setTimeout(function() { if (el) el.remove(); }, 300); }
+      return;
+    }
+
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'upload-tracker';
+      document.body.appendChild(el);
+      requestAnimationFrame(function() { el.style.opacity = '1'; });
+    }
+    el.style.cssText = 'position:fixed;bottom:18px;right:16px;left:auto;width:min(430px,calc(100vw - 24px));'
+      + 'max-height:calc(100vh - 36px);overflow:auto;background:#fff;border:1px solid #dbe4f0;border-radius:12px;'
+      + 'padding:12px 14px;z-index:720;box-shadow:0 12px 32px rgba(15,23,42,0.16);'
+      + 'font-family:Poppins,sans-serif;transition:opacity 0.3s;opacity:' + (el.style.opacity || '1') + ';';
+
+    var html = '';
+    var successCount = total - failed - logPending - uploading - retrying;
+    if (successCount < 0) successCount = 0;
+
+    if (isActive) {
+      var pct = total > 0 ? Math.round(successCount / total * 100) : 0;
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+        + '<span style="font-size:13px;font-weight:600;color:#1e293b">Upload ' + total + ' foto</span>'
+        + '<span style="font-size:11px;color:#64748b">' + successCount + '/' + total + ' selesai</span></div>';
+      html += '<div style="height:6px;background:#f1f5f9;border-radius:3px;overflow:hidden;margin-bottom:6px">'
+        + '<div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,#3b82f6,#22c55e);border-radius:3px;transition:width 0.3s"></div></div>';
+
+      if (retrying > 0) {
+        html += '<div style="font-size:11px;color:#f59e0b;font-weight:500">'
+          + retrying + ' foto sedang retry otomatis...</div>';
+      }
+    }
+
+    if (failed > 0) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-top:' + (isActive ? '8' : '0') + 'px;margin-bottom:8px">'
+        + '<div style="width:28px;height:28px;border-radius:7px;background:#fef2f2;display:flex;'
+        + 'align-items:center;justify-content:center;flex-shrink:0">'
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2">'
+        + '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/>'
+        + '<line x1="9" y1="9" x2="15" y2="15"/></svg></div>'
+        + '<div style="flex:1"><div style="font-size:13px;font-weight:600;color:#1e293b">'
+        + failed + ' foto gagal</div></div></div>';
+      html += '<div style="display:flex;gap:6px">'
+        + '<button onclick="dismissUploadTrackerV2()" style="flex:1;padding:6px;border:1px solid #e2e8f0;'
+        + 'border-radius:6px;background:#fff;font-size:11px;color:#64748b;cursor:pointer;font-family:inherit">Abaikan</button>'
+        + '<button onclick="handleRetryAll()" style="flex:2;padding:6px;border:none;border-radius:6px;'
+        + 'background:#1d4ed8;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">'
+        + 'Kirim ulang ' + failed + ' foto</button></div>';
+    }
+
+    if (logPending > 0 && failed === 0) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        + '<div style="width:28px;height:28px;border-radius:7px;background:#fffbeb;display:flex;'
+        + 'align-items:center;justify-content:center;flex-shrink:0">'
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2">'
+        + '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>'
+        + '<line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>'
+        + '<div style="flex:1"><div style="font-size:13px;font-weight:600;color:#92400e">'
+        + 'Foto sudah di Drive, data belum tersimpan</div>'
+        + '<div style="font-size:11px;color:#b45309">' + logPending + ' item pending</div></div></div>';
+      html += '<button onclick="retryPendingLogs()" style="width:100%;padding:6px;border:none;border-radius:6px;'
+        + 'background:#f59e0b;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">'
+        + 'Simpan ulang data</button>';
+    }
+
+    el.innerHTML = html;
+  });
+}
+
+function scrollToFirstFailedPhoto() {
+  renderLocalThumbnails();
+  setTimeout(function() {
+    var el = document.querySelector('.photo-local.failed-state, .photo-local[data-local-id]');
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, 120);
+}
+
+var _recoveryNoticeTargetLocalId = '';
+var _recoveryNoticeDismissKey = '';
+
+function getRecoveryNoticeTargetLocalId_(oldItems, oldPendingLogs) {
+  oldItems = oldItems || [];
+  oldPendingLogs = oldPendingLogs || [];
+  var activeContainerId = String(state.activeContainerId || '');
+  var activeTab = String(state.activeTab || '');
+  var preferred = oldItems.filter(function(item) {
+    return item && String(item.containerId || '') === activeContainerId
+      && String(item.category || item.uploadType || '') === activeTab;
+  });
+  var candidates = preferred.length ? preferred : oldItems;
+  candidates = candidates.filter(function(item) {
+    return item && item.localId && (isManualActionStatus(item.status) || item.status === 'FAILED_LOG' || item.status === 'FAILED_LOG_MANUAL');
+  });
+  if (candidates.length > 0) return candidates[0].localId;
+  if (oldPendingLogs.length > 0 && oldPendingLogs[0].localId) return oldPendingLogs[0].localId;
+  return '';
+}
+
+function openRecoveryNoticeTarget() {
+  var localId = _recoveryNoticeTargetLocalId;
+  renderLocalThumbnails();
+  if (!localId) {
+    scrollToFirstFailedPhoto();
+    return;
+  }
+  setTimeout(function() {
+    var el = document.querySelector('.photo-local[data-local-id="' + localId + '"]');
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, 120);
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item) {
+      retryPendingLogs('', true);
+      return;
+    }
+    if (isPaletMissingDetails_(item)) {
+      handleRetryPhoto(localId);
+      return;
+    }
+    showUploadItemActions(localId);
+  });
+}
+
+function dismissRecoveryNotice() {
+  var el = document.getElementById('upload-recovery-notice');
+  if (el) el.remove();
+  if (_recoveryNoticeDismissKey) {
+    try {
+      sessionStorage.setItem(_recoveryNoticeDismissKey, String(Date.now()));
+    } catch (e) {}
+  }
+}
+
+function deprecatedRenderUploadTrackerV2Unfiltered_() {
+  getLocalQueue().then(function(items) {
+    return _idbGetAll(STORE_PENDING_LOG).then(function(pendingLogs) {
+      return { items: items, pendingLogs: pendingLogs };
+    });
+  }).then(function(data) {
+    var items = data.items;
+    var pendingLogs = data.pendingLogs;
+    var el = document.getElementById('upload-tracker');
+
+    var uploading = 0, retrying = 0, failed = 0, logPending = 0, waiting = 0, total = items.length;
+    var pendingLogIds = {};
+    pendingLogs.forEach(function(p) { pendingLogIds[p.localId] = true; });
+    items.forEach(function(i) {
+      if (i.status === 'UPLOADING' || i.status === 'COMPRESSING' || i.status === 'READY_TO_UPLOAD') uploading++;
+      else if (i.status && i.status.indexOf('RETRY') >= 0) retrying++;
+      else if (i.status === 'WAITING_MANUAL_RETRY' || i.status === 'FAILED_UPLOAD') failed++;
+      else if (i.status === 'FAILED_LOG' || i.status === 'LOG_PENDING' || i.status === 'UPLOAD_SUCCESS') {
+        if (!pendingLogIds[i.localId]) logPending++;
+      }
+      else if (i.status === 'LOCAL_SAVED' || i.status === 'WAITING_BATCH') waiting++;
+    });
+    logPending += pendingLogs.length;
+
+    var isActive = uploading > 0 || retrying > 0 || waiting > 0;
+    var hasIssues = failed > 0 || logPending > 0;
+
+    if (!isActive && !hasIssues && total === 0) {
+      if (el) { el.style.opacity = '0'; setTimeout(function() { if (el) el.remove(); }, 300); }
+      return;
+    }
+
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'upload-tracker';
+      document.body.appendChild(el);
+      requestAnimationFrame(function() { el.style.opacity = '1'; });
+    }
+    el.style.cssText = 'position:fixed;bottom:18px;right:16px;left:auto;width:min(430px,calc(100vw - 24px));'
+      + 'max-height:calc(100vh - 36px);overflow:auto;background:#fff;border:1px solid #dbe4f0;border-radius:12px;'
+      + 'padding:12px 14px;z-index:720;box-shadow:0 12px 32px rgba(15,23,42,0.16);'
+      + 'font-family:Poppins,sans-serif;transition:opacity 0.3s;opacity:' + (el.style.opacity || '1') + ';';
+
+    var successCount = total - failed - logPending - uploading - retrying - waiting;
+    if (successCount < 0) successCount = 0;
+    var html = '';
+
+    if (isActive || _activeBatchProgress) {
+      var pct = total > 0 ? Math.round(successCount / total * 100) : 0;
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+        + '<span style="font-size:13px;font-weight:600;color:#1e293b">Upload ' + total + ' foto</span>'
+        + '<span style="font-size:11px;color:#64748b">' + successCount + '/' + total + ' selesai</span></div>';
+      html += '<div style="height:6px;background:#f1f5f9;border-radius:3px;overflow:hidden;margin-bottom:8px">'
+        + '<div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,#3b82f6,#22c55e);border-radius:3px;transition:width 0.3s"></div></div>';
+
+      if (_activeBatchProgress) {
+        html += '<div style="background:#f8fafc;border-radius:8px;padding:8px 10px;margin-bottom:8px">'
+          + '<div style="display:flex;justify-content:space-between;gap:8px">'
+          + '<span style="font-size:12px;font-weight:700;color:#334155">' + _activeBatchProgress.label + '</span>'
+          + '<span style="font-size:11px;color:#64748b">' + _activeBatchProgress.sent + '/' + _activeBatchProgress.total + ' foto</span></div>'
+          + '<div style="font-size:11px;color:#64748b;margin-top:2px">' + _activeBatchProgress.phase + '</div></div>';
+      }
+
+      if (retrying > 0) {
+        html += '<div style="font-size:11px;color:#f59e0b;font-weight:500">'
+          + retrying + ' foto sedang retry otomatis...</div>';
+      }
+    }
+
+    if (failed > 0) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-top:' + (isActive ? '8' : '0') + 'px;margin-bottom:8px">'
+        + '<div style="width:28px;height:28px;border-radius:7px;background:#fef2f2;display:flex;align-items:center;justify-content:center;flex-shrink:0">'
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2">'
+        + '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div>'
+        + '<div style="flex:1"><div style="font-size:13px;font-weight:600;color:#1e293b">'
+        + failed + ' foto gagal</div><div style="font-size:11px;color:#64748b">Foto gagal tetap tersimpan di perangkat ini</div></div></div>';
+      html += '<div style="display:flex;gap:6px">'
+        + '<button onclick="scrollToFirstFailedPhoto()" style="flex:1;padding:6px;border:1px solid #e2e8f0;border-radius:6px;background:#fff;font-size:11px;color:#334155;cursor:pointer;font-family:inherit">Lihat foto gagal</button>'
+        + '<button onclick="handleRetryAll()" style="flex:1;padding:6px;border:none;border-radius:6px;background:#1d4ed8;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">Kirim ulang semua</button></div>';
+    }
+
+    if (logPending > 0 && failed === 0) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        + '<div style="width:28px;height:28px;border-radius:7px;background:#fffbeb;display:flex;align-items:center;justify-content:center;flex-shrink:0">'
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2">'
+        + '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>'
+        + '<line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>'
+        + '<div style="flex:1"><div style="font-size:13px;font-weight:600;color:#92400e">Foto sudah di Drive, data belum tersimpan</div>'
+        + '<div style="font-size:11px;color:#b45309">' + logPending + ' item pending</div></div></div>';
+      html += '<button onclick="retryPendingLogs()" style="width:100%;padding:6px;border:none;border-radius:6px;background:#f59e0b;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">Simpan ulang data</button>';
+    }
+
+    el.innerHTML = html;
+  });
+}
+
+function renderRecoveryNotice(oldItems, oldPendingLogs) {
+  var count = (oldItems || []).length + (oldPendingLogs || []).length;
+  var el = document.getElementById('upload-recovery-notice');
+  if (count === 0) {
+    _recoveryNoticeTargetLocalId = '';
+    _recoveryNoticeDismissKey = '';
+    if (el) el.remove();
+    return;
+  }
+  _recoveryNoticeTargetLocalId = getRecoveryNoticeTargetLocalId_(oldItems, oldPendingLogs);
+  var newestUpdatedAt = 0;
+  (oldItems || []).forEach(function(item) {
+    newestUpdatedAt = Math.max(newestUpdatedAt, Number(item && (item.updatedAt || item.createdAt)) || 0);
+  });
+  (oldPendingLogs || []).forEach(function(log) {
+    newestUpdatedAt = Math.max(newestUpdatedAt, Number(log && (log.updatedAt || log.createdAt)) || 0);
+  });
+  _recoveryNoticeDismissKey = 'uploadRecoveryDismissed_' + count + '_' + newestUpdatedAt;
+  try {
+    if (sessionStorage.getItem(_recoveryNoticeDismissKey)) {
+      if (el) el.remove();
+      return;
+    }
+  } catch (e) {}
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'upload-recovery-notice';
+    el.style.cssText = 'position:fixed;left:8px;right:8px;bottom:148px;z-index:750;pointer-events:auto;'
+      + 'background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:10px 12px;'
+      + 'font-family:Poppins,sans-serif;box-shadow:0 6px 18px rgba(0,0,0,0.08);';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = '<div style="display:flex;align-items:center;gap:10px">'
+    + '<div style="width:26px;height:26px;border-radius:7px;background:#f59e0b;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px">!</div>'
+    + '<div style="flex:1"><div style="font-size:12px;font-weight:700;color:#92400e">Ada upload lama yang belum selesai</div>'
+    + '<div style="font-size:11px;color:#b45309">' + count + ' item upload belum selesai.</div></div>'
+    + '<button type="button" onclick="openRecoveryNoticeTarget()" style="padding:6px 10px;border:none;border-radius:7px;background:#f59e0b;color:#fff;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit">Lihat</button>'
+    + '<button type="button" onclick="dismissRecoveryNotice()" aria-label="Tutup notifikasi upload lama" style="width:28px;height:28px;border:1px solid #fde68a;border-radius:7px;background:#fff7ed;color:#92400e;font-size:17px;font-weight:700;line-height:1;cursor:pointer;font-family:inherit">&times;</button></div>';
+}
+
+function clampUploadTrackerPercent_(value) {
+  value = Number(value) || 0;
+  if (value < 0) return 0;
+  if (value > 100) return 100;
+  return Math.round(value);
+}
+
+function getUploadTrackerPhaseMeta_(activeProgress, counts, basePct) {
+  counts = counts || {};
+  var phase = String(activeProgress && activeProgress.phase || '');
+  var sent = Number(activeProgress && activeProgress.sent || 0);
+  var batchTotal = Number(activeProgress && activeProgress.total || 0);
+  var batchPct = batchTotal > 0 ? clampUploadTrackerPercent_(sent / batchTotal * 100) : 0;
+  var meta = {
+    tone: 'info',
+    badge: 'Berjalan',
+    title: 'Upload sedang diproses',
+    detail: 'Sistem sedang menyiapkan dan mengirim foto.',
+    step: 'Proses upload',
+    progressPct: Math.max(clampUploadTrackerPercent_(basePct), counts.waiting > 0 ? 5 : 0),
+    batchPct: batchPct,
+    batchText: batchTotal > 0 ? sent + '/' + batchTotal + ' foto' : '',
+    indeterminate: true
+  };
+
+  if (_uploadPausedOffline || !navigator.onLine) {
+    meta.tone = 'danger';
+    meta.badge = 'Dijeda';
+    meta.title = 'Koneksi terputus';
+    meta.detail = 'Upload aman tersimpan di perangkat dan akan lanjut saat koneksi kembali.';
+    meta.step = 'Menunggu koneksi';
+    meta.progressPct = Math.max(meta.progressPct, 5);
+    return meta;
+  }
+
+  if (counts.retrying > 0) {
+    meta.tone = 'warning';
+    meta.badge = 'Retry';
+    meta.title = 'Menunggu coba ulang otomatis';
+    meta.detail = counts.retrying + ' foto akan dikirim ulang otomatis.';
+    meta.step = 'Retry upload';
+    meta.progressPct = Math.max(meta.progressPct, 12);
+    return meta;
+  }
+
+  if (phase.indexOf('Mengompres') >= 0 || phase.indexOf('Menyiapkan foto') >= 0) {
+    meta.badge = 'Kompresi';
+    meta.title = 'Mengompres foto';
+    meta.detail = 'Foto sedang diproses di perangkat sebelum dikirim.';
+    meta.step = 'Menyiapkan foto';
+    meta.progressPct = Math.max(meta.progressPct, 6 + Math.round(batchPct * 0.12));
+    meta.batchText = batchTotal > 0 ? sent + '/' + batchTotal + ' foto diproses' : '';
+    meta.indeterminate = sent < batchTotal;
+    return meta;
+  }
+
+  if (phase.indexOf('Sinkronisasi') >= 0 || counts.syncPending > 0) {
+    meta.tone = 'info';
+    meta.badge = 'Sinkronisasi';
+    meta.title = 'Menyinkronkan tampilan';
+    meta.detail = 'Data sudah tersimpan. Aplikasi sedang memastikan foto muncul di session detail, dashboard, SJ Qty, dan handover.';
+    meta.step = 'Verifikasi final';
+    meta.progressPct = Math.max(meta.progressPct, 96);
+    meta.batchPct = 100;
+    meta.batchText = counts.syncPending > 0 ? counts.syncPending + ' foto menunggu tampilan final' : 'Menunggu tampilan final';
+    meta.indeterminate = true;
+    return meta;
+  }
+
+  if (phase.indexOf('Mengambil akses') >= 0) {
+    meta.badge = 'Akses Drive';
+    meta.title = 'Menyiapkan akses Drive';
+    meta.detail = 'Foto belum dikirim. Sistem sedang meminta token akses Drive.';
+    meta.step = 'Langkah 1 dari 3';
+    meta.progressPct = Math.max(meta.progressPct, 8);
+    meta.batchText = batchTotal > 0 ? '0/' + batchTotal + ' foto disiapkan' : '';
+    return meta;
+  }
+
+  if (phase.indexOf('Mengirim foto') >= 0) {
+    meta.badge = 'Kirim Drive';
+    meta.title = 'Mengirim foto ke Drive';
+    meta.detail = batchTotal > 0
+      ? sent + ' dari ' + batchTotal + ' foto sudah masuk Drive.'
+      : 'Foto sedang dikirim ke Drive.';
+    meta.step = 'Langkah 2 dari 3';
+    meta.progressPct = Math.max(meta.progressPct, 18 + Math.round(batchPct * 0.62));
+    meta.batchText = batchTotal > 0 ? sent + '/' + batchTotal + ' foto terkirim' : '';
+    meta.indeterminate = sent < batchTotal;
+    return meta;
+  }
+
+  if (phase.indexOf('Menyimpan data') >= 0 || counts.logPending > 0) {
+    meta.tone = 'warning';
+    meta.badge = 'Simpan data';
+    meta.title = 'Menyimpan data ke sistem';
+    meta.detail = 'File sudah masuk Drive. Data sedang disimpan agar muncul di laporan.';
+    meta.step = 'Langkah 3 dari 3';
+    meta.progressPct = Math.max(meta.progressPct, 88);
+    meta.batchPct = 100;
+    meta.batchText = batchTotal > 0 ? batchTotal + '/' + batchTotal + ' foto masuk Drive' : '';
+    meta.indeterminate = true;
+    return meta;
+  }
+
+  if (counts.waiting > 0) {
+    meta.badge = 'Antrean';
+    meta.title = 'Menyiapkan antrean upload';
+    meta.detail = counts.waiting + ' foto sudah diproses di perangkat dan menunggu batch dimulai.';
+    meta.step = 'Menunggu giliran';
+    meta.progressPct = Math.max(meta.progressPct, 5);
+    return meta;
+  }
+
+  if (counts.failed > 0) {
+    meta.tone = 'danger';
+    meta.badge = 'Butuh tindakan';
+    meta.title = 'Sebagian foto belum terkirim';
+    meta.detail = 'Cek foto gagal atau kirim ulang semua.';
+    meta.step = 'Perlu dicek';
+    meta.indeterminate = false;
+  }
+
+  return meta;
+}
+
+function isUploadPausedForResult_() {
+  if (typeof isUploadOfflineNow === 'function') return isUploadOfflineNow();
+  var banner = document.getElementById('offline-banner');
+  return _uploadPausedOffline || !navigator.onLine || !!(banner && banner.classList.contains('show'));
+}
+
+function showUploadPausedResult_(successCount, pendingUpload, pendingLog, failed, syncPending, jobId) {
+  successCount = Math.max(0, Number(successCount) || 0);
+  pendingUpload = Math.max(0, Number(pendingUpload) || 0);
+  pendingLog = Math.max(0, Number(pendingLog) || 0);
+  failed = Math.max(0, Number(failed) || 0);
+  syncPending = Math.max(0, Number(syncPending) || 0);
+  var title = pendingUpload > 0 ? 'Upload dijeda' : (syncPending > 0 ? 'Data tersimpan, tampilan belum final' : 'Upload belum bisa diverifikasi');
+  var note = pendingUpload > 0
+    ? 'Koneksi sedang offline. Foto yang belum selesai tetap tersimpan di perangkat dan akan dilanjutkan saat koneksi kembali.'
+    : (syncPending > 0
+      ? 'Data sudah tersimpan ke sistem, tetapi aplikasi belum berhasil memastikan foto tampil di session detail, dashboard, SJ Qty, dan handover.'
+      : 'Koneksi sedang offline, jadi aplikasi belum menampilkan status selesai sampai sinkronisasi benar-benar aman.');
+  var actionButton = syncPending > 0
+    ? '<button onclick="Swal.close();finalizeSyncPendingItems(\'' + (jobId || '') + '\', true)" style="width:100%;margin-top:10px;padding:9px;border:none;border-radius:8px;background:#2563eb;color:#fff;font-size:12px;font-weight:700;font-family:inherit;cursor:pointer">Sinkronkan ulang tampilan</button>'
+    : '';
+  Swal.fire({
+    icon: 'warning',
+    title: title,
+    html: '<div style="text-align:left">'
+      + '<p style="font-size:13px;color:#64748b;margin-bottom:12px">' + note + '</p>'
+      + '<div style="display:flex;gap:8px;margin-bottom:12px">'
+      + '<div style="flex:1;background:#f0fdf4;border-radius:8px;padding:10px;text-align:center">'
+      + '<div style="font-size:20px;font-weight:700;color:#15803d">' + successCount + '</div><div style="font-size:11px;color:#22c55e">Selesai</div></div>'
+      + '<div style="flex:1;background:#fffbeb;border-radius:8px;padding:10px;text-align:center">'
+      + '<div style="font-size:20px;font-weight:700;color:#92400e">' + (pendingUpload + pendingLog + syncPending) + '</div><div style="font-size:11px;color:#f59e0b">Menunggu</div></div>'
+      + '<div style="flex:1;background:#fef2f2;border-radius:8px;padding:10px;text-align:center">'
+      + '<div style="font-size:20px;font-weight:700;color:#dc2626">' + failed + '</div><div style="font-size:11px;color:#ef4444">Gagal</div></div></div>'
+      + '<p style="font-size:12px;color:#64748b;margin:0">Jangan klik selesai/finish sampai banner offline hilang dan tracker upload bersih.</p>' + actionButton + '</div>',
+    confirmButtonText: 'OK',
+    customClass: { popup: 'custom-swal', confirmButton: 'btn-primary' },
+    buttonsStyling: false
+  });
+}
+
+function renderUploadTrackerV2() {
+  getLocalQueue().then(function(allItems) {
+    return _idbGetAll(STORE_PENDING_LOG).then(function(pendingLogs) {
+      return { allItems: allItems, pendingLogs: pendingLogs };
+    });
+  }).then(function(data) {
+    var allItems = data.allItems || [];
+    var pendingLogs = data.pendingLogs || [];
+    var activeJobId = getActiveUploadJobId();
+    var items = filterUploadJobItems(allItems, activeJobId);
+    var activePendingLogs = activeJobId ? pendingLogs.filter(function(p) { return isSameUploadJob(p, activeJobId); }) : [];
+    var oldItems = allItems.filter(function(item) {
+      return isUnfinishedLocalUpload(item) && (!activeJobId || !isSameUploadJob(item, activeJobId));
+    });
+    var oldPendingLogs = pendingLogs.filter(function(p) {
+      return !activeJobId || !isSameUploadJob(p, activeJobId);
+    });
+    renderRecoveryNotice(oldItems, oldPendingLogs);
+
+    var el = document.getElementById('upload-tracker');
+    if (completeUploadJobIfClear_(activeJobId, items, activePendingLogs)) {
+      if (el) { el.style.opacity = '0'; setTimeout(function() { if (el) el.remove(); }, 250); }
+      return;
+    }
+    if (!activeJobId) {
+      if (el) { el.style.opacity = '0'; setTimeout(function() { if (el) el.remove(); }, 250); }
+      return;
+    }
+
+    var uploading = 0, retrying = 0, failed = 0, logPending = 0, waiting = 0, syncPending = 0;
+    var pendingLogIds = {};
+    activePendingLogs.forEach(function(p) { pendingLogIds[p.localId] = true; });
+    items.forEach(function(i) {
+      if (i.status === 'UPLOADING' || i.status === 'COMPRESSING' || i.status === 'PREPARING' || i.status === 'READY_TO_UPLOAD' || i.status === 'SLOW_NETWORK' || i.status === 'OFFLINE_PAUSED' || i.status === 'ONLINE_RESUMING') uploading++;
+      else if (i.status && i.status.indexOf('RETRY') >= 0) retrying++;
+      else if (isManualActionStatus(i.status)) failed++;
+      else if (i.status === 'SYNC_PENDING') syncPending++;
+      else if (i.status === 'FAILED_LOG' || i.status === 'LOG_PENDING' || i.status === 'UPLOAD_SUCCESS') {
+        if (!pendingLogIds[i.localId]) logPending++;
+      }
+      else if (i.status === 'LOCAL_SAVED' || i.status === 'WAITING_BATCH') waiting++;
+    });
+    logPending += activePendingLogs.length;
+
+    var total = (_activeUploadJob && _activeUploadJob.totalCount) || items.length;
+    var isActive = uploading > 0 || retrying > 0 || waiting > 0 || syncPending > 0;
+    var hasIssues = failed > 0 || logPending > 0;
+    var activeProgress = _activeBatchProgress && _activeBatchProgress.jobId === activeJobId ? _activeBatchProgress : null;
+
+    if (!isActive && !hasIssues && total === 0) {
+      if (el) { el.style.opacity = '0'; setTimeout(function() { if (el) el.remove(); }, 300); }
+      return;
+    }
+
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'upload-tracker';
+      document.body.appendChild(el);
+      requestAnimationFrame(function() { el.style.opacity = '1'; });
+    }
+    el.style.cssText = 'position:fixed;bottom:18px;right:16px;left:auto;width:min(430px,calc(100vw - 24px));'
+      + 'max-height:calc(100vh - 36px);overflow:auto;background:#fff;border:1px solid #dbe4f0;border-radius:12px;'
+      + 'padding:12px 14px;z-index:720;box-shadow:0 12px 32px rgba(15,23,42,0.16);'
+      + 'font-family:Poppins,sans-serif;transition:opacity 0.3s;opacity:' + (el.style.opacity || '1') + ';';
+
+    var successCount = total - failed - logPending - uploading - retrying - waiting - syncPending;
+    if (successCount < 0) successCount = 0;
+    var pct = total > 0 ? Math.round(successCount / total * 100) : 0;
+    var phaseMeta = getUploadTrackerPhaseMeta_(activeProgress, {
+      waiting: waiting,
+      retrying: retrying,
+      failed: failed,
+      logPending: logPending,
+      uploading: uploading,
+      syncPending: syncPending
+    }, pct);
+    el.className = 'upload-tracker-card upload-tracker-' + phaseMeta.tone + (phaseMeta.indeterminate ? ' is-indeterminate' : '');
+
+    var html = '<div class="upload-tracker-head">'
+      + '<div class="upload-tracker-title-wrap">'
+      + '<span class="upload-tracker-spinner" aria-hidden="true"></span>'
+      + '<div class="upload-tracker-copy">'
+      + '<div class="upload-tracker-title-row">'
+      + '<span class="upload-tracker-title">Upload ' + total + ' foto</span>'
+      + '<span class="upload-tracker-badge">' + escapeHtml(phaseMeta.badge) + '</span></div>'
+      + '<div class="upload-tracker-message">' + escapeHtml(phaseMeta.title) + '</div></div></div>'
+      + '<div class="upload-tracker-count" style="display:flex;align-items:center;gap:6px">'
+      + '<div><strong>' + phaseMeta.progressPct + '%</strong><span>' + successCount + '/' + total + ' selesai</span></div>'
+      + '<button onclick="dismissUploadTrackerV2()" title="Tutup pop-up" style="background:transparent;border:none;font-size:18px;color:#94a3b8;cursor:pointer;padding:0 4px">&times;</button></div></div>'
+      + '<div class="upload-tracker-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + phaseMeta.progressPct + '">'
+      + '<div class="upload-tracker-fill" style="width:' + phaseMeta.progressPct + '%"></div></div>'
+      + '<div class="upload-tracker-detail"><span>' + escapeHtml(phaseMeta.step) + '</span><span>' + escapeHtml(phaseMeta.detail) + '</span></div>';
+
+    if (activeProgress) {
+      html += '<div class="upload-tracker-batch">'
+        + '<div class="upload-tracker-batch-top"><span>' + escapeHtml(activeProgress.label) + '</span><strong>' + escapeHtml(phaseMeta.batchText || (activeProgress.sent + '/' + activeProgress.total + ' foto')) + '</strong></div>'
+        + '<div class="upload-tracker-mini-bar"><div style="width:' + phaseMeta.batchPct + '%"></div></div>'
+        + '<div class="upload-tracker-phase">' + escapeHtml(activeProgress.phase) + '</div></div>';
+    }
+
+    if (_uploadPausedOffline || !navigator.onLine) {
+      html += '<div style="font-size:11px;color:#dc2626;font-weight:700;margin-bottom:6px">Koneksi terputus. Upload dijeda dan tersimpan di perangkat ini.</div>';
+    } else if (retrying > 0) {
+      html += '<div style="font-size:11px;color:#f59e0b;font-weight:600;margin-bottom:6px">' + retrying + ' foto menunggu retry otomatis.</div>';
+    } else if (logPending > 0 && failed === 0) {
+      html += '<div style="font-size:11px;color:#92400e;font-weight:600;margin-bottom:6px">File sudah masuk Drive, data sistem sedang/menunggu tersimpan.</div>';
+    } else if (syncPending > 0) {
+      html += '<div style="font-size:11px;color:#2563eb;font-weight:600;margin-bottom:6px">Data tersimpan, sedang memastikan tampilan sudah final.</div>';
+    }
+
+    if (failed > 0) {
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;margin-bottom:8px">'
+        + '<div style="width:28px;height:28px;border-radius:7px;background:#fef2f2;display:flex;align-items:center;justify-content:center;flex-shrink:0">'
+        + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2">'
+        + '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div>'
+        + '<div style="flex:1"><div style="font-size:13px;font-weight:600;color:#1e293b">' + failed + ' foto butuh tindakan</div>'
+        + '<div style="font-size:11px;color:#64748b">Foto tetap tersimpan di perangkat ini.</div></div></div>'
+        + '<div style="display:flex;gap:6px">'
+        + '<button onclick="scrollToFirstFailedPhoto()" style="flex:1;padding:6px;border:1px solid #e2e8f0;border-radius:6px;background:#fff;font-size:11px;color:#334155;cursor:pointer;font-family:inherit">Lihat foto gagal</button>'
+        + '<button onclick="handleRetryAll(\'' + activeJobId + '\')" style="flex:1;padding:6px;border:none;border-radius:6px;background:#1d4ed8;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">Kirim ulang semua</button></div>';
+    }
+
+    if (logPending > 0 && failed === 0) {
+      html += '<button onclick="retryPendingLogs(\'' + activeJobId + '\')" style="width:100%;padding:6px;border:none;border-radius:6px;background:#f59e0b;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">Simpan Data ke Sistem</button>';
+    } else if (syncPending > 0 && failed === 0) {
+      html += '<button onclick="finalizeSyncPendingItems(\'' + activeJobId + '\', true)" style="width:100%;padding:6px;border:none;border-radius:6px;background:#2563eb;font-size:11px;font-weight:600;color:#fff;cursor:pointer;font-family:inherit">Sinkronkan ulang tampilan</button>';
+    }
+
+    el.innerHTML = html;
+  });
+}
+
+window.dismissUploadTrackerV2 = function() {
+  var el = document.getElementById('upload-tracker');
+  if (el) { el.style.opacity = '0'; setTimeout(function(){ if (el) el.remove(); }, 300); }
+  if (_activeUploadJob) _activeUploadJob.status = 'DISMISSED';
+  _activeBatchProgress = null;
+  renderLocalThumbnails();
+};
+
+// =========================================================================
+// 10. POPUP RESULT — Correct Success/Failure
+// =========================================================================
+
+async function deprecatedShowUploadResultLegacy_(totalCount) {
+  var items = await getLocalQueue();
+  var pendingLogs = await _idbGetAll(STORE_PENDING_LOG);
+
+  var failed = items.filter(function(i) {
+    return isManualActionStatus(i.status);
+  }).length;
+  var logPending = items.filter(function(i) { return i.status === 'FAILED_LOG'; }).length + pendingLogs.length;
+  var uploading = items.filter(function(i) {
+    return i.status === 'UPLOADING'
+      || i.status === 'COMPRESSING'
+      || i.status === 'READY_TO_UPLOAD'
+      || i.status === 'SLOW_NETWORK'
+      || i.status === 'OFFLINE_PAUSED'
+      || i.status === 'ONLINE_RESUMING'
+      || (i.status && i.status.indexOf('RETRY') >= 0);
+  }).length;
+  var waiting = items.filter(function(i) {
+    return i.status === 'LOCAL_SAVED' || i.status === 'WAITING_BATCH';
+  }).length;
+
+  var successCount = totalCount - failed - logPending - uploading - waiting;
+  if (successCount < 0) successCount = 0;
+  var pendingUpload = Math.max(0, totalCount - successCount - failed - logPending);
+
+  if (isUploadPausedForResult_() || uploading > 0 || waiting > 0) {
+    showUploadPausedResult_(successCount, pendingUpload, logPending, failed);
+    renderUploadTrackerV2();
+    return;
+  }
+
+  if (failed === 0 && logPending === 0 && uploading === 0 && waiting === 0) {
+    // All success
+    Toast.fire({ icon: 'success', title: 'Upload ' + successCount + ' foto selesai!' });
+  } else if (logPending > 0 && failed === 0) {
+    // Drive OK but Sheet failed
+    Swal.fire({
+      icon: 'warning',
+      title: 'Foto sudah di Drive',
+      html: '<div style="text-align:left">'
+        + '<p style="font-size:13px;color:#64748b;margin-bottom:12px">Foto sudah masuk Drive, tapi data belum tersimpan ke database.</p>'
+        + '<div style="display:flex;gap:8px;margin-bottom:12px">'
+        + '<div style="flex:1;background:#f0fdf4;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#15803d">' + successCount + '</div>'
+        + '<div style="font-size:11px;color:#22c55e">Di Drive</div></div>'
+        + '<div style="flex:1;background:#fffbeb;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#92400e">' + logPending + '</div>'
+        + '<div style="font-size:11px;color:#f59e0b">Data pending</div></div></div></div>',
+      showCancelButton: true,
+      confirmButtonText: 'Simpan ulang data',
+      cancelButtonText: 'Nanti saja',
+      customClass: { popup: 'custom-swal', confirmButton: 'btn-primary', cancelButton: 'btn-primary' },
+      buttonsStyling: false
+    }).then(function(r) {
+      if (r.isConfirmed) retryPendingLogs();
+    });
+  } else {
+    // Some failed
+    Swal.fire({
+      icon: 'warning',
+      title: 'Sebagian foto belum terkirim',
+      html: '<div style="text-align:left">'
+        + '<div style="display:flex;gap:8px;margin-bottom:12px">'
+        + '<div style="flex:1;background:#f0fdf4;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#15803d">' + successCount + '</div>'
+        + '<div style="font-size:11px;color:#22c55e">Berhasil</div></div>'
+        + '<div style="flex:1;background:#fef2f2;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#dc2626">' + failed + '</div>'
+        + '<div style="font-size:11px;color:#ef4444">Gagal</div></div></div>'
+        + '<p style="font-size:12px;color:#64748b;margin:0">Foto gagal tetap tampil. Klik tombol retry di gambar untuk mengirim ulang.</p></div>',
+      confirmButtonText: 'OK',
+      customClass: { popup: 'custom-swal', confirmButton: 'btn-primary' },
+      buttonsStyling: false
+    });
+  }
+}
+
+async function showUploadResult(totalCount, job) {
+  var allItems = await getLocalQueue();
+  var pendingLogs = await _idbGetAll(STORE_PENDING_LOG);
+  var jobId = job && job.jobId;
+  var items = jobId ? allItems.filter(function(i) { return i.jobId === jobId; }) : allItems;
+  var jobPendingLogs = jobId ? pendingLogs.filter(function(p) {
+    return p.jobId === jobId || (p.meta && p.meta.jobId === jobId);
+  }) : pendingLogs;
+  var unfinishedItems = items.filter(isUnfinishedLocalUpload);
+
+  var failed = items.filter(function(i) {
+    return isManualActionStatus(i.status) && i.failureStage !== 'log';
+  }).length;
+  var pendingLogIds = {};
+  jobPendingLogs.forEach(function(p) { pendingLogIds[p.localId] = true; });
+  var logPending = items.filter(function(i) {
+    return (i.status === 'FAILED_LOG' || i.status === 'LOG_PENDING' || i.status === 'UPLOAD_SUCCESS') && !pendingLogIds[i.localId];
+  }).length + jobPendingLogs.length;
+  var syncPending = items.filter(function(i) {
+    return i.status === 'SYNC_PENDING';
+  }).length;
+  var uploading = items.filter(function(i) {
+    return i.status === 'UPLOADING' || i.status === 'COMPRESSING' || i.status === 'PREPARING' || i.status === 'READY_TO_UPLOAD' || i.status === 'SLOW_NETWORK' || i.status === 'OFFLINE_PAUSED' || i.status === 'ONLINE_RESUMING' || (i.status && i.status.indexOf('RETRY') >= 0);
+  }).length;
+  var waiting = items.filter(function(i) {
+    return i.status === 'LOCAL_SAVED' || i.status === 'WAITING_BATCH';
+  }).length;
+  var activeRetryCount = Object.keys(_activeRetryTimers).filter(function(localId) {
+    return items.some(function(item) { return item.localId === localId; });
+  }).length;
+  var successCount = totalCount - failed - logPending - syncPending - uploading - waiting;
+  if (successCount < 0) successCount = 0;
+  var pendingDisplay = logPending || jobPendingLogs.length;
+  var pendingUpload = Math.max(0, totalCount - successCount - failed - pendingDisplay - syncPending);
+  var pausedForResult = isUploadPausedForResult_()
+    || uploading > 0
+    || waiting > 0
+    || activeRetryCount > 0
+    || syncPending > 0;
+
+  if (pausedForResult) {
+    setUploadJobStatus(job || _activeUploadJob, 'UPLOADING', {
+      successCount: successCount,
+      failedCount: failed,
+      pendingLogCount: pendingDisplay,
+      syncPendingCount: syncPending
+    });
+    renderUploadTrackerV2();
+    showUploadPausedResult_(successCount, pendingUpload, pendingDisplay, failed, syncPending, jobId);
+    return;
+  }
+
+  if (failed === 0 && logPending === 0 && syncPending === 0 && uploading === 0 && waiting === 0 && activeRetryCount === 0 && jobPendingLogs.length === 0 && unfinishedItems.length === 0) {
+    setUploadJobStatus(job || _activeUploadJob, 'DONE', {
+      successCount: totalCount,
+      failedCount: 0,
+      pendingLogCount: 0,
+      syncPendingCount: 0
+    });
+    _activeBatchProgress = null;
+    Toast.fire({ icon: 'success', title: 'Upload ' + totalCount + ' foto selesai!' });
+    return;
+  }
+
+  var nextStatus = syncPending > 0 && failed === 0 ? 'SYNC_PENDING' : (pendingDisplay > 0 && failed === 0 ? 'LOG_PENDING' : (successCount > 0 ? 'PARTIAL_FAILED' : 'FAILED'));
+  setUploadJobStatus(job || _activeUploadJob, nextStatus, {
+    successCount: successCount,
+    failedCount: failed,
+    pendingLogCount: pendingDisplay,
+    syncPendingCount: syncPending
+  });
+
+  if (pendingDisplay > 0 && failed === 0) {
+    Swal.fire({
+      icon: 'warning',
+      title: 'File sudah di Drive',
+      html: '<div style="text-align:left">'
+        + '<p style="font-size:13px;color:#64748b;margin-bottom:12px">File sudah tersimpan di Drive, tetapi data belum tersimpan ke sistem.</p>'
+        + '<div style="display:flex;gap:8px;margin-bottom:12px">'
+        + '<div style="flex:1;background:#f0fdf4;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#15803d">' + successCount + '</div><div style="font-size:11px;color:#22c55e">Di Drive</div></div>'
+        + '<div style="flex:1;background:#fffbeb;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#92400e">' + pendingDisplay + '</div><div style="font-size:11px;color:#f59e0b">Data pending</div></div></div></div>',
+      showCancelButton: true,
+      confirmButtonText: 'Simpan Data ke Sistem',
+      cancelButtonText: 'Nanti saja',
+      customClass: { popup: 'custom-swal', confirmButton: 'btn-primary', cancelButton: 'btn-primary' },
+      buttonsStyling: false
+    }).then(function(r) {
+      if (r.isConfirmed) retryPendingLogs(jobId);
+    });
+  } else {
+    Swal.fire({
+      icon: 'warning',
+      title: 'Sebagian foto belum terkirim',
+      html: '<div style="text-align:left">'
+        + '<div style="display:flex;gap:8px;margin-bottom:12px">'
+        + '<div style="flex:1;background:#f0fdf4;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#15803d">' + successCount + '</div><div style="font-size:11px;color:#22c55e">Berhasil</div></div>'
+        + '<div style="flex:1;background:#fef2f2;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#dc2626">' + failed + '</div><div style="font-size:11px;color:#ef4444">Gagal</div></div>'
+        + '<div style="flex:1;background:#fffbeb;border-radius:8px;padding:10px;text-align:center">'
+        + '<div style="font-size:20px;font-weight:700;color:#92400e">' + pendingDisplay + '</div><div style="font-size:11px;color:#f59e0b">Pending</div></div></div>'
+        + '<p style="font-size:12px;color:#64748b;margin:0">Foto gagal tetap tampil. Gunakan tombol retry di tengah thumbnail.</p></div>',
+      showDenyButton: true,
+      showCancelButton: true,
+      confirmButtonText: 'Kirim ulang semua',
+      denyButtonText: 'Lihat foto gagal',
+      cancelButtonText: 'OK',
+      customClass: { popup: 'custom-swal', confirmButton: 'btn-primary', denyButton: 'btn-primary', cancelButton: 'btn-primary' },
+      buttonsStyling: false
+    }).then(function(r) {
+      if (r.isConfirmed) handleRetryAll(jobId);
+      else if (r.isDenied) scrollToFirstFailedPhoto();
+    });
+  }
+}
+
+// =========================================================================
+// 11. LOCAL THUMBNAIL RENDERING
+// =========================================================================
+
+// In-memory cache of local items for current container/tab
+var _localThumbnailCache = [];
+var localBatchSelectedIds = [];
+
+function isLocalBatchSelectModeActive_() {
+  return typeof batchSelectMode !== 'undefined' && !!batchSelectMode;
+}
+
+function isLocalItemSelectableForBatch_(item) {
+  if (!item) return false;
+  if (item.status === 'DONE' || item.status === 'FINAL_SYNCED') return false;
+  if (item.status === 'UPLOADING' || item.status === 'COMPRESSING' || item.status === 'PREPARING') return false;
+  if (String(item.status || '').indexOf('RETRY') >= 0) return false;
+  return isManualActionStatus(item.status) || item.status === 'FAILED_LOG' || item.status === 'FAILED_LOG_MANUAL';
+}
+
+function getSelectableLocalBatchItems_(items) {
+  return (items || []).filter(isLocalItemSelectableForBatch_);
+}
+
+function syncLocalBatchSelection_(items) {
+  var selectable = {};
+  getSelectableLocalBatchItems_(items).forEach(function(item) { selectable[item.localId] = true; });
+  localBatchSelectedIds = localBatchSelectedIds.filter(function(localId) { return !!selectable[localId]; });
+  if (!isLocalBatchSelectModeActive_()) localBatchSelectedIds = [];
+}
+
+function toggleLocalPhotoSelect(localId) {
+  if (!isLocalBatchSelectModeActive_()) return;
+  var idx = localBatchSelectedIds.indexOf(localId);
+  if (idx >= 0) localBatchSelectedIds.splice(idx, 1);
+  else localBatchSelectedIds.push(localId);
+  renderLocalThumbnails();
+}
+
+function localBatchSelectAll() {
+  if (!isLocalBatchSelectModeActive_()) return;
+  var selectable = getSelectableLocalBatchItems_(_localThumbnailCache);
+  if (selectable.length === 0) return;
+  if (localBatchSelectedIds.length === selectable.length) {
+    localBatchSelectedIds = [];
+  } else {
+    localBatchSelectedIds = selectable.map(function(item) { return item.localId; });
+  }
+  renderLocalThumbnails();
+}
+
+async function handleRetrySelectedLocalPhotos() {
+  var ids = localBatchSelectedIds.slice();
+  if (ids.length === 0) {
+    Toast.fire({ icon: 'info', title: 'Pilih foto gagal dulu' });
+    return;
+  }
+  var items = [];
+  for (var i = 0; i < ids.length; i++) {
+    var item = await _idbGet(STORE_QUEUE, ids[i]);
+    if (item && isLocalItemSelectableForBatch_(item)) items.push(item);
+  }
+  if (items.length === 0) {
+    localBatchSelectedIds = [];
+    renderLocalThumbnails();
+    Toast.fire({ icon: 'info', title: 'Tidak ada foto gagal yang bisa diproses' });
+    return;
+  }
+
+  var paletMissing = sortPaletItemsForPrompt_(items.filter(isPaletMissingDetails_));
+  if (paletMissing.length > 0) {
+    var draftKeySuffix = getPaletDraftSuffixForItems_(paletMissing, 'selected_local_' + Date.now());
+    var paletDetails = await promptPaletDetailsWithDraft(paletMissing, draftKeySuffix);
+    if (paletDetails) {
+      await applyPaletDetailsToLocalItems_(paletMissing, paletDetails, draftKeySuffix);
+    } else {
+      await markPaletItemsNeedUserAction_(paletMissing);
+      var missingMap = {};
+      paletMissing.forEach(function(item) { missingMap[item.localId] = true; });
+      items = items.filter(function(item) { return !missingMap[item.localId]; });
+    }
+  }
+
+  localBatchSelectedIds = [];
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+
+  for (var r = 0; r < items.length; r++) {
+    cancelAutoRetryItem(items[r].localId);
+    await executeRetryUpload(items[r].localId, true);
+  }
+  renderLocalThumbnails();
+  renderUploadTrackerV2();
+}
+
+function renderLocalBatchBar_(grid, items) {
+  var selectable = getSelectableLocalBatchItems_(items);
+  var oldBar = grid.querySelector('.local-batch-bar');
+  if (oldBar) oldBar.remove();
+  if (!isLocalBatchSelectModeActive_() || selectable.length === 0) return;
+
+  var selectedCount = localBatchSelectedIds.length;
+  var bar = document.createElement('div');
+  bar.className = 'local-batch-bar';
+  bar.style.cssText = 'grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:8px 12px;'
+    + 'background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;margin-bottom:2px;';
+  bar.innerHTML = '<span style="flex:1;font-size:12px;font-weight:700;color:#c2410c">'
+    + selectedCount + ' dari ' + selectable.length + ' foto gagal lokal dipilih</span>'
+    + '<button type="button" onclick="event.stopPropagation();localBatchSelectAll()" style="padding:4px 10px;border:1px solid #fdba74;border-radius:6px;background:#fff;font-size:10px;font-weight:700;color:#c2410c;cursor:pointer;font-family:inherit">'
+    + (selectedCount === selectable.length && selectable.length > 0 ? 'Batal semua' : 'Pilih semua')
+    + '</button>'
+    + '<button type="button" onclick="event.stopPropagation();handleRetrySelectedLocalPhotos()" style="padding:4px 10px;border:none;border-radius:6px;background:' + (selectedCount > 0 ? '#ea580c' : '#e2e8f0') + ';font-size:10px;font-weight:700;color:' + (selectedCount > 0 ? '#fff' : '#94a3b8') + ';cursor:pointer;font-family:inherit"'
+    + (selectedCount === 0 ? ' disabled' : '') + '>Proses</button>';
+  grid.insertBefore(bar, grid.firstChild);
+}
+
+function renderLocalThumbnails() {
+  if (!state.activeContainerId) return;
+  var containerId = state.activeContainerId;
+  var category = state.activeTab;
+
+  getLocalQueueForContainer(containerId, category).then(function(items) {
+    _localThumbnailCache = items;
+    syncLocalBatchSelection_(items);
+    var grid = document.getElementById('photo-grid');
+    if (!grid) return;
+
+    // Remove old local thumbnails
+    var oldLocals = grid.querySelectorAll('.photo-local, .local-batch-bar');
+    oldLocals.forEach(function(el) { el.remove(); });
+
+    // Get the "add" button to insert before it
+    var addBtn = grid.querySelector('.photo-add');
+    renderLocalBatchBar_(grid, items);
+
+    items.forEach(function(item) {
+      if (item.status === 'DONE' || item.status === 'FINAL_SYNCED') return; // Already synced, skip
+
+      var box = document.createElement('div');
+      var failedLike = isManualActionStatus(item.status) || item.status === 'FAILED_LOG';
+      var localSelectMode = isLocalBatchSelectModeActive_() && isLocalItemSelectableForBatch_(item);
+      var localSelected = localBatchSelectedIds.indexOf(item.localId) >= 0;
+      box.className = 'photo-box photo-local' + (failedLike ? ' failed-state' : '') + (localSelected ? ' selected' : '');
+      box.setAttribute('data-local-id', item.localId);
+      box.style.position = 'relative';
+      if (localSelected) box.style.outline = '3px solid #ea580c';
+      if (localSelected) box.style.outlineOffset = '-3px';
+
+      // Thumbnail image
+      var imgSrc = item.previewUrl || '';
+      var imgHtml = imgSrc
+        ? '<img src="' + imgSrc + '" alt="Local foto" style="width:100%;height:100%;object-fit:cover;border-radius:6px">'
+        : '<div style="width:100%;height:100%;border-radius:6px;background:#f8fafc;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:11px;font-weight:700;text-align:center;padding:8px;box-sizing:border-box">Menyiapkan foto</div>';
+
+      // Status overlay
+      var overlayHtml = '';
+      var statusHtml = '';
+
+      if (item.status === 'UPLOADING' || item.status === 'COMPRESSING' || item.status === 'PREPARING' || item.status === 'SLOW_NETWORK' || item.status === 'OFFLINE_PAUSED' || item.status === 'ONLINE_RESUMING') {
+        overlayHtml = '<div class="photo-overlay-uploading"></div>';
+        statusHtml = '<div class="photo-status-badge uploading"><span class="spinner-small"></span> ' + escapeHtml(getUploadStatusMessage(item)) + '</div>';
+        box.onclick = function() { showLocalLightbox(item.localId); };
+
+      } else if (String(item.status || '').indexOf('RETRY') >= 0 && String(item.status || '').indexOf('WAITING') >= 0) {
+        var retryNum = item.status.replace(/[^0-9]/g, '') || '?';
+        overlayHtml = '<div class="photo-overlay-retrying"></div>';
+        statusHtml = '<div class="photo-status-badge retrying info">Mencoba ulang ' + retryNum + '/' + MAX_AUTO_RETRY + '...</div>'
+          + '<button class="btn-retry-now-mini" onclick="event.stopPropagation();handleRetryPhoto(\'' + item.localId + '\')" title="Kirim sekarang">Kirim sekarang</button>';
+        box.onclick = function(e) {
+          if (e.target.closest('.btn-retry-now-mini')) return;
+          showLocalLightbox(item.localId);
+        };
+
+      } else if (item.status === 'WAITING_MANUAL_RETRY' || item.status === 'FAILED_UPLOAD' || item.status === 'FAILED_UPLOAD_MANUAL') {
+        overlayHtml = '<div class="photo-overlay-failed"></div>';
+        if (localSelectMode) {
+          statusHtml = '<div class="photo-status-badge failed">Pilih untuk proses ulang</div>';
+          box.onclick = function(e) { e.stopPropagation(); toggleLocalPhotoSelect(item.localId); };
+        } else {
+          statusHtml = '<button class="photo-status-badge failed clickable" onclick="event.stopPropagation();handleRetryPhoto(\'' + item.localId + '\')">Gagal dikirim. Ketuk untuk kirim ulang.</button>';
+          overlayHtml += '<button class="btn-retry-center" onclick="event.stopPropagation();handleRetryPhoto(\'' + item.localId + '\')" aria-label="Kirim ulang foto" title="Kirim ulang">'
+            + '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5">'
+            + '<path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>';
+          box.onclick = function(e) {
+            if (e.target.closest('.btn-retry-center') || e.target.closest('.photo-status-badge.clickable')) return;
+            showLocalLightbox(item.localId);
+          };
+        }
+
+      } else if (item.status === 'FAILED_LOG' || item.status === 'FAILED_LOG_MANUAL') {
+        overlayHtml = '<div class="photo-overlay-log-pending"></div>';
+        if (localSelectMode) {
+          statusHtml = '<div class="photo-status-badge log-pending">Pilih untuk simpan data</div>';
+          box.onclick = function(e) { e.stopPropagation(); toggleLocalPhotoSelect(item.localId); };
+        } else {
+          statusHtml = '<button class="photo-status-badge log-pending clickable" onclick="event.stopPropagation();retryPendingLogs(\'' + item.jobId + '\', true)">Data belum tersimpan ke sistem. Simpan Data ke Sistem.</button>';
+          box.onclick = function(e) {
+            if (e.target.closest('.photo-status-badge.clickable')) return;
+            showLocalLightbox(item.localId);
+          };
+        }
+
+      } else if (item.status === 'NEED_USER_ACTION') {
+        overlayHtml = '<div class="photo-overlay-failed"></div>';
+        if (localSelectMode) {
+          statusHtml = '<div class="photo-status-badge failed">Pilih untuk dilengkapi</div>';
+          box.onclick = function(e) { e.stopPropagation(); toggleLocalPhotoSelect(item.localId); };
+        } else {
+          overlayHtml += '<button class="btn-retry-center" onclick="event.stopPropagation();handleRetryPhoto(\'' + item.localId + '\')" aria-label="Coba lagi" title="Coba lagi">'
+            + '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5">'
+            + '<path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>';
+          statusHtml = '<button class="photo-status-badge failed clickable" onclick="event.stopPropagation();showUploadItemActions(\'' + item.localId + '\')">Butuh tindakan</button>';
+          box.onclick = function(e) {
+            if (e.target.closest('.btn-retry-center') || e.target.closest('.photo-status-badge.clickable')) return;
+            showLocalLightbox(item.localId);
+          };
+        }
+
+      } else if (item.status === 'SYNC_PENDING') {
+        overlayHtml = '<div class="photo-overlay-log-pending"></div>';
+        statusHtml = '<button class="photo-status-badge log-pending clickable" onclick="event.stopPropagation();finalizeSyncPendingItems(\'' + item.jobId + '\', true)">Tersimpan. Sinkronkan tampilan.</button>';
+        box.onclick = function(e) {
+          if (e.target.closest('.photo-status-badge.clickable')) return;
+          showLocalLightbox(item.localId);
+        };
+
+      } else if (item.status === 'UPLOAD_SUCCESS' || item.status === 'LOG_PENDING') {
+        statusHtml = '<div class="photo-status-badge log-pending" style="background:#fffbeb;color:#92400e">Menyimpan data ke sistem...</div>';
+        box.onclick = function() { showLocalLightbox(item.localId); };
+
+      } else {
+        // LOCAL_SAVED, WAITING_BATCH etc
+        overlayHtml = '<div class="photo-overlay-waiting"></div>';
+        statusHtml = '<div class="photo-status-badge waiting">Menunggu...</div>';
+        box.onclick = function() { showLocalLightbox(item.localId); };
+      }
+
+      if (localSelectMode) {
+        overlayHtml += '<div style="position:absolute;top:4px;left:4px;z-index:8;width:22px;height:22px;border-radius:50%;border:2px solid ' + (localSelected ? '#ea580c' : '#fdba74') + ';background:' + (localSelected ? '#ea580c' : 'rgba(255,255,255,0.9)') + ';display:flex;align-items:center;justify-content:center;pointer-events:none">'
+          + (localSelected ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>' : '')
+          + '</div>';
+      }
+
+      box.innerHTML = imgHtml + overlayHtml + statusHtml;
+
+      if (addBtn) {
+        grid.insertBefore(box, addBtn);
+      } else {
+        grid.appendChild(box);
+      }
+    });
+  });
+}
+
+function showLocalLightbox(localId) {
+  _idbGet(STORE_QUEUE, localId).then(function(item) {
+    if (!item || !item.blob) return;
+    var url = URL.createObjectURL(item.blob);
+    showLightbox(url);
+    // Revoke after close — attach one-time listener
+    var lb = document.getElementById('lightbox');
+    function onClose() {
+      URL.revokeObjectURL(url);
+      lb.removeEventListener('transitionend', onClose);
+    }
+    if (lb) {
+      // We'll revoke when lightbox is hidden
+      var origClose = window.closeLightbox;
+      window.closeLightbox = function() {
+        origClose();
+        URL.revokeObjectURL(url);
+        window.closeLightbox = origClose;
+      };
+    }
+  });
+}
+
+// =========================================================================
+// 12. RECOVERY — Resume after browser refresh
+// =========================================================================
+
+async function recoverPendingUploads() {
+  try {
+    await openUploadDB();
+  } catch (e) {
+    console.warn('IndexedDB not available:', e);
+    return;
+  }
+
+  var items = await getLocalQueue();
+  var pendingLogs = await _idbGetAll(STORE_PENDING_LOG);
+
+  // Re-create previewUrls for items still in queue
+  var recoveredCount = 0;
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    if (item.status === 'DONE') {
+      await removeFromLocal(item.localId);
+      continue;
+    }
+
+    // Recreate preview URL from blob
+    if (item.blob) {
+      try {
+        item.previewUrl = URL.createObjectURL(item.blob);
+        await _idbPut(STORE_QUEUE, item);
+      } catch (e) {
+        // Blob might be corrupt
+        console.warn('Failed to recreate preview for', item.localId);
+      }
+    }
+
+    if (isPaletMissingDetails_(item) && (item.blob || item.fileId)) {
+      await updateLocalItem(item.localId, {
+        status: 'NEED_USER_ACTION',
+        failureStage: 'metadata',
+        manualStatus: 'PALET_DETAILS_PENDING',
+        errorMessage: 'Data palet belum lengkap. Ketuk untuk melengkapi.',
+        errorType: 'USER_ACTION_REQUIRED'
+      });
+      recoveredCount++;
+      continue;
+    }
+
+    // Reset uploading items back to retry state
+    if (item.status === 'UPLOADING' || item.status === 'COMPRESSING' || item.status === 'PREPARING' || item.status === 'READY_TO_UPLOAD') {
+      await updateLocalItem(item.localId, {
+        status: 'WAITING_MANUAL_RETRY',
+        errorMessage: 'Upload terputus karena halaman dimuat ulang'
+      });
+    }
+    // Reset retrying items
+    if (String(item.status || '').indexOf('RETRY') >= 0 && String(item.status || '').indexOf('WAITING') < 0) {
+      await updateLocalItem(item.localId, {
+        status: 'WAITING_MANUAL_RETRY',
+        errorMessage: 'Retry terputus karena halaman dimuat ulang'
+      });
+    }
+
+    recoveredCount++;
+  }
+
+  if (recoveredCount > 0 || pendingLogs.length > 0) {
+    console.log('Recovered ' + recoveredCount + ' upload items, ' + pendingLogs.length + ' pending logs');
+    renderUploadTrackerV2();
+    // Will render thumbnails when user navigates to the appropriate container
+  }
+}
+
+// =========================================================================
+// 13. MAIN UPLOAD ENTRY — Replaces old handleMultiUpload pipeline
+// =========================================================================
+
+async function handleMultiUploadV2(input) {
+  var uploadTabType = state.activeTab;
+  var files = Array.from(input.files);
+  if (!files.length) return;
+  if (!ensureCanEditSession('upload foto')) { input.value = ''; return; }
+  var c = state.containers.find(function(x) { return x.id === state.activeContainerId; });
+  if (!c) { Toast.fire({ icon: 'warning', title: 'Pilih armada dulu' }); input.value = ''; return; }
+  if (typeof ensureCanUploadToContainer === 'function' && !ensureCanUploadToContainer(c, 'upload foto')) { input.value = ''; return; }
+  var isPaletUpload = uploadTabType === 'palet';
+
+  var uploadTraceId = createCrudTraceId('uploadPhoto');
+  crudTrace('uploadPhoto', uploadTraceId, 'client_click', { count: files.length, type: uploadTabType });
+  var uploadJob = createUploadJob(files.length, [uploadTabType]);
+  uploadJob.sessionId = state.activeSessionId;
+  uploadJob.traceId = uploadTraceId;
+  var paletDraftSuffix = 'active_draft_' + String(c.id);
+  setUploadJobStatus(uploadJob, 'INIT');
+  _activeBatchProgress = null;
+  uploadInProgress = true;
+  input.value = '';
+
+  var sess = state.activeSession || {};
+  var baseMeta = {
+    sessionId: state.activeSessionId, brand: sess.brand || '',
+    shipment: sess.shipment || '', date: sess.date || '', pic: sess.pic || '',
+    fleetNo: c.number, uploadedBy: state.username,
+    containerId: c.id, jobId: uploadJob.jobId,
+    uploadType: uploadTabType,
+    traceId: uploadTraceId,
+    driver: c.driver || '', plate: c.plate || '', type: c.type || ''
+  };
+
+  // === PHASE 1: Compress + Save to IndexedDB ===
+  var localItems = [];
+  var COMPRESS_C = CLIENT_CONFIG.COMPRESS_CONCURRENCY || 3;
+  var compressCursor = 0;
+  var compressedCount = 0;
+
+  async function compressAndSaveWorker() {
+    while (compressCursor < files.length) {
+      var idx = compressCursor++;
+      var item = null;
+      try {
+        var meta = JSON.parse(JSON.stringify(baseMeta));
+        meta.containerId = c.id;
+        meta.sourceIndex = idx;
+        meta.originalFileName = files[idx] && files[idx].name ? files[idx].name : '';
+        var fileName = generatePhotoFileName(uploadTabType, idx, null);
+        meta.fileName = fileName;
+        item = await createLocalPlaceholder(meta, fileName);
+        localItems.push(item);
+        setActiveBatchProgress({
+          jobId: uploadJob.jobId,
+          batchId: 'compress-' + uploadJob.jobId,
+          label: 'Menyiapkan foto',
+          totalItems: files.length
+        }, 'Mengompres foto', compressedCount, files.length);
+        setUploadJobStatus(uploadJob, 'PREPARING');
+        renderUploadTrackerV2();
+        renderLocalThumbnails();
+
+        var blob = await compressImgToBlob(files[idx]);
+        var previewUrl = URL.createObjectURL(blob);
+        item = await updateLocalItem(item.localId, {
+          blob: blob,
+          previewUrl: previewUrl,
+          fileName: fileName,
+          status: 'LOCAL_SAVED'
+        });
+        compressedCount++;
+        setActiveBatchProgress({
+          jobId: uploadJob.jobId,
+          batchId: 'compress-' + uploadJob.jobId,
+          label: 'Menyiapkan foto',
+          totalItems: files.length
+        }, 'Mengompres foto', compressedCount, files.length);
+      } catch (e) {
+        console.warn('Compress/save failed for file ' + idx + ':', e);
+        if (item && item.localId) {
+          await updateLocalItem(item.localId, {
+            status: 'FAILED_UPLOAD',
+            failureStage: 'upload',
+            errorMessage: 'Foto gagal diproses: ' + (e && e.message ? e.message : String(e)),
+            errorType: 'PERMANENT'
+          });
+        }
+      }
+      renderLocalThumbnails();
+      renderUploadTrackerV2();
+    }
+  }
+
+  var cWorkers = [];
+  for (var ci = 0; ci < Math.min(COMPRESS_C, files.length); ci++) cWorkers.push(compressAndSaveWorker());
+  Swal.fire({
+    title: 'Menyimpan foto lokal...',
+    html: '<p style="font-size:13px;color:#64748b;margin:0">Foto diamankan dulu ke perangkat sebelum proses berikutnya.</p>',
+    allowOutsideClick: false,
+    allowEscapeKey: false,
+    customClass: { popup: 'custom-swal' },
+    didOpen: function() { Swal.showLoading(); }
+  });
+  try {
+    await Promise.all(cWorkers);
+  } finally {
+    Swal.close();
+  }
+
+  if (localItems.length === 0) {
+    uploadInProgress = false;
+    setUploadJobStatus(uploadJob, 'FAILED');
+    Swal.fire({ icon: 'error', title: 'Gagal', text: 'Tidak ada foto yang berhasil diproses.', customClass: { popup: 'custom-swal' } });
+    return;
+  }
+  setUploadJobStatus(uploadJob, 'LOCAL_SAVED');
+  crudTrace('uploadPhoto', uploadTraceId, 'local_saved', { items: localItems.length });
+  var savedLocalItems = sortPaletItemsForPrompt_((await getLocalQueue()).filter(function(item) {
+    return item.status === 'LOCAL_SAVED' && item.meta && item.meta.containerId === c.id && item.meta.uploadType === uploadTabType;
+  }));
+  if (isPaletUpload && savedLocalItems.length > 0) {
+    crudTrace('uploadPhoto', uploadTraceId, 'palet_details_prompt_start', { items: savedLocalItems.length });
+    var paletDetails = await promptPaletDetailsWithDraft(savedLocalItems, paletDraftSuffix);
+    if (!paletDetails || paletDetails === 'ISI_NANTI' || paletDetails === 'KAMERA') {
+      uploadInProgress = false;
+      _activeBatchProgress = null;
+      renderUploadTrackerV2();
+      renderLocalThumbnails();
+      
+      if (paletDetails === 'KAMERA') {
+        setUploadJobStatus(uploadJob, 'PENDING_CAMERA');
+        crudTrace('uploadPhoto', uploadTraceId, 'palet_details_camera');
+      } else {
+        await markPaletItemsNeedUserAction_(savedLocalItems);
+        setUploadJobStatus(uploadJob, 'FAILED', { failedCount: savedLocalItems.length });
+        crudTrace('uploadPhoto', uploadTraceId, 'palet_details_pending', { items: savedLocalItems.length });
+        Toast.fire({ icon: 'info', title: 'Foto palet tersimpan. Lengkapi data palet dari thumbnail.' });
+      }
+      return;
+    }
+    await applyPaletDetailsToLocalItems_(savedLocalItems, paletDetails, paletDraftSuffix);
+    crudTrace('uploadPhoto', uploadTraceId, 'palet_details_saved', { items: savedLocalItems.length });
+    renderLocalThumbnails();
+    renderUploadTrackerV2();
+  }
+
+  var uploadableItems = (await getLocalQueue()).filter(function(item) {
+    return (item.status === 'LOCAL_SAVED' || item.status === 'READY_TO_UPLOAD') && item.meta && item.meta.containerId === c.id && item.meta.uploadType === uploadTabType;
+  });
+  if (uploadableItems.length === 0) {
+    uploadInProgress = false;
+    setUploadJobStatus(uploadJob, 'FAILED');
+    await showUploadResult(uploadJob.totalCount, uploadJob);
+    renderUploadTrackerV2();
+    renderLocalThumbnails();
+    return;
+  }
+
+  // === PHASE 2: Create Batches ===
+  var batches = createBatches(uploadableItems, uploadTabType, uploadJob.jobId);
+
+  // Save batches and update items in IndexedDB
+  for (var bi = 0; bi < batches.length; bi++) {
+    await _idbPut(STORE_BATCH, batches[bi]);
+    for (var bj = 0; bj < batches[bi].itemIds.length; bj++) {
+      await updateLocalItem(batches[bi].itemIds[bj], {
+        batchId: batches[bi].batchId,
+        jobId: uploadJob.jobId,
+        status: 'WAITING_BATCH'
+      });
+    }
+  }
+
+  // === PHASE 3: Execute Batches Sequentially ===
+  resetUploadTokenManager(baseMeta);
+  crudTrace('uploadPhoto', uploadTraceId, 'upload_batches_start', { batches: batches.length });
+  for (var bk = 0; bk < batches.length; bk++) {
+    await executeBatchUpload(batches[bk], uploadJob);
+  }
+  crudTrace('uploadPhoto', uploadTraceId, 'upload_batches_end');
+
+  // === PHASE 4: Show Result ===
+  uploadInProgress = false;
+  await showUploadResult(uploadJob.totalCount, uploadJob);
+  crudTrace('uploadPhoto', uploadTraceId, 'client_done');
+  renderUploadTrackerV2();
+  renderLocalThumbnails();
+}
+
+// =========================================================================
+// 14. INIT — Called from showApp()
+// =========================================================================
+function initUploadModule() {
+  if (_uploadModuleInitialized) return;
+  _uploadModuleInitialized = true;
+  openUploadDB().then(function() {
+    if (!navigator.onLine) handleUploadOffline();
+    recoverPendingUploads();
+  }).catch(function(e) {
+    console.warn('Upload module init failed:', e);
+  });
+}
+</script>
